@@ -1,0 +1,4 @@
+# False positives — example JWT tokens in JSDoc/docgen output
+# These are placeholder tokens in code examples, not real credentials.
+dist/esm/definitions.d.ts:generic-api-key:75
+dist/docs.json:generic-api-key:34
