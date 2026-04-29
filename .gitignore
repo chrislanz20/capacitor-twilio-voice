@@ -1,5 +1,5 @@
 # node files
-dist
+# dist intentionally tracked — private fork, committed build so consumers don't need build tools
 node_modules
 
 # iOS files
