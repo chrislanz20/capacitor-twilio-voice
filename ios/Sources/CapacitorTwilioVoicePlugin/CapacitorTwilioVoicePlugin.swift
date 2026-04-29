@@ -41,6 +41,8 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         CAPPluginMethod(name: "rejectCall", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "endCall", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "muteCall", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "holdCall", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "sendDigits", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setSpeaker", returnType: CAPPluginReturnPromise),
 
         CAPPluginMethod(name: "getCallStatus", returnType: CAPPluginReturnPromise),
@@ -559,6 +561,54 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         }
 
         activeCall.isMuted = muted
+        call.resolve(["success": true])
+    }
+
+    @objc func holdCall(_ call: CAPPluginCall) {
+        guard let held = call.getBool("hold") else {
+            call.reject("hold parameter is required")
+            return
+        }
+
+        let callSid = call.getString("callSid")
+        var targetCall: Call?
+
+        if let callSid = callSid {
+            targetCall = activeCalls[callSid]
+        } else {
+            targetCall = getActiveCall()
+        }
+
+        guard let activeCall = targetCall else {
+            call.reject("No active call found")
+            return
+        }
+
+        activeCall.isOnHold = held
+        call.resolve(["success": true])
+    }
+
+    @objc func sendDigits(_ call: CAPPluginCall) {
+        guard let digits = call.getString("digits"), !digits.isEmpty else {
+            call.reject("digits parameter is required")
+            return
+        }
+
+        let callSid = call.getString("callSid")
+        var targetCall: Call?
+
+        if let callSid = callSid {
+            targetCall = activeCalls[callSid]
+        } else {
+            targetCall = getActiveCall()
+        }
+
+        guard let activeCall = targetCall else {
+            call.reject("No active call found")
+            return
+        }
+
+        activeCall.sendDigits(digits)
         call.resolve(["success": true])
     }
 

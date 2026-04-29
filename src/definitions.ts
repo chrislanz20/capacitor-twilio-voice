@@ -261,6 +261,53 @@ export interface CapacitorTwilioVoicePlugin {
   muteCall(options: { muted: boolean; callSid?: string }): Promise<{ success: boolean }>;
 
   /**
+   * Place an active call on hold or take it off hold.
+   *
+   * Hold pauses the call's media without disconnecting it. The remote party hears
+   * silence (or hold music if configured server-side via TwiML); the local user
+   * hears no audio. Re-issuing with `hold: false` resumes the call.
+   *
+   * iOS: wraps `TVOCall.isOnHold = held` from the Twilio Voice iOS SDK.
+   *
+   * @param options - Configuration object
+   * @param options.hold - true to put the call on hold, false to take off hold
+   * @param options.callSid - Unique identifier of the call (optional, defaults to current active call)
+   * @returns Promise that resolves with success status
+   *
+   * @example
+   * ```typescript
+   * await CapacitorTwilioVoice.holdCall({ hold: true });
+   * // ... talk to colleague, prepare transfer, etc.
+   * await CapacitorTwilioVoice.holdCall({ hold: false });
+   * ```
+   */
+  holdCall(options: { hold: boolean; callSid?: string }): Promise<{ success: boolean }>;
+
+  /**
+   * Send DTMF (touch-tone) digits on an active call.
+   *
+   * Used to navigate IVR phone menus mid-call (e.g., "press 1 for billing").
+   * Multiple digits can be sent in one call; characters supported are 0-9, *, #, w (wait).
+   *
+   * iOS: wraps `TVOCall.sendDigits(_:)` from the Twilio Voice iOS SDK.
+   *
+   * @param options - Configuration object
+   * @param options.digits - String of DTMF characters to send (e.g., "1234", "*70#")
+   * @param options.callSid - Unique identifier of the call (optional, defaults to current active call)
+   * @returns Promise that resolves with success status
+   *
+   * @example
+   * ```typescript
+   * // Press "1" to navigate to billing menu
+   * await CapacitorTwilioVoice.sendDigits({ digits: '1' });
+   *
+   * // Send a sequence
+   * await CapacitorTwilioVoice.sendDigits({ digits: '1234#' });
+   * ```
+   */
+  sendDigits(options: { digits: string; callSid?: string }): Promise<{ success: boolean }>;
+
+  /**
    * Enable or disable speakerphone mode.
    *
    * When enabled, audio will be routed through the device's speaker instead of the earpiece.
