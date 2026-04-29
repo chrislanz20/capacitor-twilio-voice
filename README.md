@@ -555,6 +555,8 @@ Common error scenarios:
 * [`rejectCall(...)`](#rejectcall)
 * [`endCall(...)`](#endcall)
 * [`muteCall(...)`](#mutecall)
+* [`holdCall(...)`](#holdcall)
+* [`sendDigits(...)`](#senddigits)
 * [`setSpeaker(...)`](#setspeaker)
 * [`getCallStatus()`](#getcallstatus)
 * [`checkMicrophonePermission()`](#checkmicrophonepermission)
@@ -721,6 +723,51 @@ When muted, the other party will not hear audio from your microphone.
 | Param         | Type                                               | Description            |
 | ------------- | -------------------------------------------------- | ---------------------- |
 | **`options`** | <code>{ muted: boolean; callSid?: string; }</code> | - Configuration object |
+
+**Returns:** <code>Promise&lt;{ success: boolean; }&gt;</code>
+
+--------------------
+
+
+### holdCall(...)
+
+```typescript
+holdCall(options: { hold: boolean; callSid?: string; }) => Promise<{ success: boolean; }>
+```
+
+Place an active call on hold or take it off hold.
+
+Hold pauses the call's media without disconnecting it. The remote party hears
+silence (or hold music if configured server-side via TwiML); the local user
+hears no audio. Re-issuing with `hold: false` resumes the call.
+
+iOS: wraps `TVOCall.isOnHold = held` from the Twilio Voice iOS SDK.
+
+| Param         | Type                                              | Description            |
+| ------------- | ------------------------------------------------- | ---------------------- |
+| **`options`** | <code>{ hold: boolean; callSid?: string; }</code> | - Configuration object |
+
+**Returns:** <code>Promise&lt;{ success: boolean; }&gt;</code>
+
+--------------------
+
+
+### sendDigits(...)
+
+```typescript
+sendDigits(options: { digits: string; callSid?: string; }) => Promise<{ success: boolean; }>
+```
+
+Send DTMF (touch-tone) digits on an active call.
+
+Used to navigate IVR phone menus mid-call (e.g., "press 1 for billing").
+Multiple digits can be sent in one call; characters supported are 0-9, *, #, w (wait).
+
+iOS: wraps `TVOCall.sendDigits(_:)` from the Twilio Voice iOS SDK.
+
+| Param         | Type                                               | Description            |
+| ------------- | -------------------------------------------------- | ---------------------- |
+| **`options`** | <code>{ digits: string; callSid?: string; }</code> | - Configuration object |
 
 **Returns:** <code>Promise&lt;{ success: boolean; }&gt;</code>
 
