@@ -619,32 +619,43 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
     }
 
     private void initializeFCM() {
-        FirebaseMessaging.getInstance()
-            .getToken()
-            .addOnCompleteListener(
-                new OnCompleteListener<String>() {
-                    @Override
-                    public void onComplete(@NonNull Task<String> task) {
-                        if (!task.isSuccessful()) {
-                            Log.w(TAG, "Fetching FCM registration token failed", task.getException());
-                            return;
-                        }
+        // FirebaseMessaging.getInstance() throws IllegalStateException when no
+        // default FirebaseApp is initialized (i.e. google-services.json was not
+        // applied at build time). This method runs inside Plugin.load() during
+        // native bridge startup, so an uncaught throw here crashes the entire
+        // app on launch — before the WebView ever loads. Guard it so a missing
+        // or misconfigured Firebase setup degrades to "push disabled" instead of
+        // a fatal launch crash.
+        try {
+            FirebaseMessaging.getInstance()
+                .getToken()
+                .addOnCompleteListener(
+                    new OnCompleteListener<String>() {
+                        @Override
+                        public void onComplete(@NonNull Task<String> task) {
+                            if (!task.isSuccessful()) {
+                                Log.w(TAG, "Fetching FCM registration token failed", task.getException());
+                                return;
+                            }
 
-                        // Get new FCM registration token
-                        fcmToken = task.getResult();
-                        Log.d(TAG, "FCM Registration Token: " + fcmToken);
+                            // Get new FCM registration token
+                            fcmToken = task.getResult();
+                            Log.d(TAG, "FCM Registration Token: " + fcmToken);
 
-                        // Store FCM token
-                        SharedPreferences prefs = getSafeContext().getSharedPreferences("CapacitorTwilioVoice", Context.MODE_PRIVATE);
-                        prefs.edit().putString(PREF_FCM_TOKEN, fcmToken).apply();
+                            // Store FCM token
+                            SharedPreferences prefs = getSafeContext().getSharedPreferences("CapacitorTwilioVoice", Context.MODE_PRIVATE);
+                            prefs.edit().putString(PREF_FCM_TOKEN, fcmToken).apply();
 
-                        // Register with Twilio if we have an access token
-                        if (accessToken != null && isTokenValid(accessToken)) {
-                            performRegistration();
+                            // Register with Twilio if we have an access token
+                            if (accessToken != null && isTokenValid(accessToken)) {
+                                performRegistration();
+                            }
                         }
                     }
-                }
-            );
+                );
+        } catch (Throwable t) {
+            Log.e(TAG, "FCM init failed; incoming-call push disabled (Firebase not configured?)", t);
+        }
     }
 
     private boolean isTokenValid(String token) {
