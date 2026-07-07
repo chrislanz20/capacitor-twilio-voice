@@ -176,22 +176,64 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         case .ended:
             NSLog("Audio session interruption ended")
 
-            // Check if we should resume
+            var options: AVAudioSession.InterruptionOptions = []
             if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
-                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-                if options.contains(.shouldResume) {
-                    do {
-                        try AVAudioSession.sharedInstance().setActive(true)
-                        audioDevice.isEnabled = true
-                        NSLog("Audio session resumed after interruption")
-                        notifyListeners("audioSessionResumed", data: nil)
-                    } catch {
-                        NSLog("Failed to resume audio session: \(error.localizedDescription)")
-                    }
-                }
+                options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
             }
+            let shouldResume = options.contains(.shouldResume)
 
-            notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
+            // AVAudioSession posts this notification on a background thread. Hop to
+            // main before touching activeCalls/audioDevice so this can't race with
+            // CXProviderDelegate's audio writes (registered on the main queue via
+            // `provider.setDelegate(self, queue: nil)`).
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+
+                // iOS does NOT guarantee .shouldResume (especially with CallKit in
+                // play, or when the interruption came from another call/Siri/alarm).
+                // If a Twilio call is still connected and not on hold, trust the
+                // call's own state over the interruption flag and re-enable audio
+                // anyway -- otherwise the call stays silent until Twilio's media
+                // timeout eventually disconnects it (the confirmed field failure).
+                //
+                // Deliberately narrow: only calls that are .connected/.reconnecting
+                // AND not isOnHold qualify. A call put on hold via
+                // CXSetHeldCallAction (e.g. the user answered the interrupting
+                // cellular call with "Hold & Accept") must NOT have its audio
+                // force-enabled here -- that would fight CallKit, which hasn't
+                // reactivated the session for us yet, and risks latching the device
+                // "on" before it can actually produce audio.
+                let hasResumableCall = self.activeCalls.values.contains { call in
+                    !call.isOnHold && (call.state == .connected || call.state == .reconnecting)
+                }
+
+                guard shouldResume || hasResumableCall else {
+                    self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
+                    return
+                }
+
+                if !shouldResume {
+                    NSLog("Interruption ended without .shouldResume but a call is still active - resuming audio anyway")
+                }
+
+                do {
+                    try AVAudioSession.sharedInstance().setActive(true)
+                } catch {
+                    NSLog("Failed to reactivate audio session after interruption: \(error.localizedDescription)")
+                }
+
+                // Re-enable the Twilio audio device even if setActive threw above:
+                // enabling the device restarts its audio unit, which manages session
+                // activation itself. Leaving it disabled here is exactly the
+                // silent-call failure mode this fix targets. Force a false->true
+                // transition rather than a bare assignment in case the device
+                // treats a same-value set as a no-op.
+                self.audioDevice.isEnabled = false
+                self.audioDevice.isEnabled = true
+                NSLog("Audio session resumed after interruption")
+                self.notifyListeners("audioSessionResumed", data: nil)
+                self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
+            }
 
         @unknown default:
             break
