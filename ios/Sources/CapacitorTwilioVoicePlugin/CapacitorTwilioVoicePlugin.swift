@@ -230,13 +230,17 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
                 // Re-enable the Twilio audio device even if setActive threw above:
                 // enabling the device restarts its audio unit, which manages session
                 // activation itself. Leaving it disabled here is exactly the
-                // silent-call failure mode this fix targets. Only restart when the
-                // device is actually disabled -- if it's already enabled (and
-                // presumably producing audio), a force false->true toggle would
-                // needlessly tear down and rebuild the audio unit mid-call.
-                if !self.audioDevice.isEnabled {
-                    self.audioDevice.isEnabled = true
-                }
+                // silent-call failure mode this fix targets. Force a false->true
+                // transition deliberately: per TVODefaultAudioDevice, isEnabled ==
+                // true is only a permission gate, not proof the audio unit is
+                // running -- a stalled unit with isEnabled latched true (e.g. an
+                // unhold that ran during the interruption) would never be restarted
+                // by a conditional set, leaving the call permanently silent. Worst
+                // case of the toggle is a sub-second audio unit rebuild, and this
+                // branch only runs after a genuine interruption ended with a
+                // resumable call.
+                self.audioDevice.isEnabled = false
+                self.audioDevice.isEnabled = true
                 NSLog("Audio session resumed after interruption")
                 self.notifyListeners("audioSessionResumed", data: nil)
                 self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
