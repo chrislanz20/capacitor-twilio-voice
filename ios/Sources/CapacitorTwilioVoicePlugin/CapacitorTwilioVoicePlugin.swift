@@ -170,8 +170,13 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         switch type {
         case .began:
             NSLog("Audio session interruption began")
-            audioDevice.isEnabled = false
-            notifyListeners("audioSessionInterrupted", data: ["type": "began"])
+            // Same main-thread confinement as the .ended branch below; the main
+            // queue is serial, so began/ended ordering is preserved.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.audioDevice.isEnabled = false
+                self.notifyListeners("audioSessionInterrupted", data: ["type": "began"])
+            }
 
         case .ended:
             NSLog("Audio session interruption ended")
@@ -225,11 +230,13 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
                 // Re-enable the Twilio audio device even if setActive threw above:
                 // enabling the device restarts its audio unit, which manages session
                 // activation itself. Leaving it disabled here is exactly the
-                // silent-call failure mode this fix targets. Force a false->true
-                // transition rather than a bare assignment in case the device
-                // treats a same-value set as a no-op.
-                self.audioDevice.isEnabled = false
-                self.audioDevice.isEnabled = true
+                // silent-call failure mode this fix targets. Only restart when the
+                // device is actually disabled -- if it's already enabled (and
+                // presumably producing audio), a force false->true toggle would
+                // needlessly tear down and rebuild the audio unit mid-call.
+                if !self.audioDevice.isEnabled {
+                    self.audioDevice.isEnabled = true
+                }
                 NSLog("Audio session resumed after interruption")
                 self.notifyListeners("audioSessionResumed", data: nil)
                 self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
@@ -627,6 +634,15 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         }
 
         activeCall.isOnHold = held
+        if !held {
+            // Mirror the CXSetHeldCallAction unhold path: if an audio session
+            // interruption disabled the audio device while this call was held,
+            // flipping isOnHold alone leaves the call silent. Main-thread
+            // confined, consistent with the interruption handlers.
+            DispatchQueue.main.async { [weak self] in
+                self?.audioDevice.isEnabled = true
+            }
+        }
         call.resolve(["success": true])
     }
 
