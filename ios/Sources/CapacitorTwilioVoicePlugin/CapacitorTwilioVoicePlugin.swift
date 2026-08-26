@@ -5,6 +5,7 @@ import CallKit
 import TwilioVoice
 import AVFoundation
 import Intents
+import UIKit
 
 let kRegistrationTTLInDays = 365
 let kCachedDeviceToken = "CachedDeviceToken"
@@ -147,6 +148,59 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             name: AVAudioSession.interruptionNotification,
             object: nil
         )
+
+        // The proximity sensor must follow the audio route, not just the call
+        // state: a staffer who hits speaker, plugs in headphones or picks up a
+        // Bluetooth headset mid-call is no longer holding the phone to their ear,
+        // and a blanked screen there is a bug, not a feature.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleAudioRouteChange(notification: Notification) {
+        updateProximityMonitoring()
+    }
+
+    /// True only when audio is coming out of the earpiece the user holds to their
+    /// head. Speaker, wired headphones, Bluetooth and CarPlay all read false.
+    private func isRoutedToEarpiece() -> Bool {
+        return AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+            $0.portType == .builtInReceiver
+        }
+    }
+
+    /// Blank the screen while the phone is at the ear, exactly as the native
+    /// Phone app does. Deliberately derived from state rather than toggled at
+    /// call-start/call-end: every path that ends a call, changes the route or
+    /// resumes audio calls this one function, so there is no path that can leave
+    /// monitoring latched on after the call. A phone whose screen keeps going
+    /// black outside a call is worse than no proximity handling at all.
+    private func updateProximityMonitoring() {
+        // Hop to main BEFORE reading activeCalls, not after. Route-change
+        // notifications arrive on a background thread, and activeCalls is
+        // mutated on main by the CallKit delegates -- the same confinement the
+        // interruption handler above relies on. UIDevice is UIKit state and must
+        // only be touched on main regardless.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let shouldMonitor = !self.activeCalls.isEmpty && self.isRoutedToEarpiece()
+            let device = UIDevice.current
+            guard device.isProximityMonitoringEnabled != shouldMonitor else { return }
+            device.isProximityMonitoringEnabled = shouldMonitor
+
+            // iOS silently refuses on hardware with no sensor (iPad rides this
+            // same build). Reading it back is the only way to know, and it is
+            // not an error -- the app simply behaves as it did before.
+            if shouldMonitor && !device.isProximityMonitoringEnabled {
+                NSLog("Proximity monitoring unavailable on this device")
+            } else {
+                NSLog("Proximity monitoring \(shouldMonitor ? "enabled" : "disabled")")
+            }
+        }
     }
 
     @objc private func handleMediaServicesReset() {
@@ -386,6 +440,8 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         activeCalls.removeAll()
         activeCallInvites.removeAll()
         activeCall = nil
+        // Signing out mid-call must not leave the screen blanking afterwards.
+        updateProximityMonitoring()
 
         NSLog("Logout completed successfully")
         call.resolve(["success": true])
@@ -1039,6 +1095,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         let call = TwilioVoiceSDK.connect(options: connectOptions, delegate: self)
         activeCall = call
         activeCalls[call.uuid!.uuidString] = call
+        updateProximityMonitoring()
         callKitCompletionCallback = completionHandler
     }
 
@@ -1055,6 +1112,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         let call = callInvite.accept(options: acceptOptions, delegate: self)
         activeCall = call
         activeCalls[call.uuid!.uuidString] = call
+        updateProximityMonitoring()
         callKitCompletionCallback = completionHandler
 
         activeCallInvites.removeValue(forKey: uuid.uuidString)
@@ -1162,6 +1220,7 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
 
         // Don't force speaker on - maintain current audio routing preference
         // toggleAudioRoute(toSpeaker: true) // Removed - this was forcing speaker on
+        updateProximityMonitoring()
         notifyListeners("callConnected", data: ["callSid": call.uuid!.uuidString])
     }
 
@@ -1173,6 +1232,7 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
     }
 
     public func callDidReconnect(call: Call) {
+        updateProximityMonitoring()
         notifyListeners("callReconnected", data: ["callSid": call.uuid!.uuidString])
     }
 
@@ -1215,6 +1275,10 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
             stopRingback()
         }
 
+        // activeCalls no longer holds this call, so this turns monitoring off
+        // whenever it was the last one.
+        updateProximityMonitoring()
+
         notifyListeners("callDisconnected", data: [
             "callSid": call.uuid!.uuidString,
             "error": error?.localizedDescription as Any
@@ -1238,6 +1302,8 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
 extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
     public func providerDidReset(_ provider: CXProvider) {
         audioDevice.isEnabled = false
+        // CallKit has torn everything down; nothing is at anyone's ear.
+        updateProximityMonitoring()
     }
 
     public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
