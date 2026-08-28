@@ -769,6 +769,48 @@ export interface CapacitorTwilioVoicePlugin {
   ): Promise<PluginListenerHandle>;
 
   /**
+   * Fired when iOS interrupts the app's audio session, and again when the
+   * interruption ends. An interruption is iOS handing the microphone to
+   * something else: an incoming cellular call, Siri, another app playing audio.
+   *
+   * These have always been emitted and were never declared, so nothing could
+   * listen to them in a type-safe way. Listen to them: an interruption that
+   * never resolves leaves a call alive with dead audio in both directions and
+   * no other trace anywhere.
+   *
+   * @param eventName - The event name ('audioSessionInterrupted')
+   * @param listenerFunc - 'began' when audio is taken, 'ended' when iOS says
+   *   the interruption is over. 'ended' does NOT guarantee audio is back.
+   */
+  addListener(
+    eventName: 'audioSessionInterrupted',
+    listenerFunc: (data: { type: 'began' | 'ended' }) => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
+   * Fired when the audio session was successfully reactivated after an
+   * interruption. Not guaranteed to follow every 'ended' — iOS only offers a
+   * resume hint for some interruption types.
+   *
+   * @param eventName - The event name ('audioSessionResumed')
+   */
+  addListener(
+    eventName: 'audioSessionResumed',
+    listenerFunc: () => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
+   * Fired when iOS reset the media services and the audio session had to be
+   * rebuilt from scratch. Rare, and worth recording when it happens.
+   *
+   * @param eventName - The event name ('audioSessionReset')
+   */
+  addListener(
+    eventName: 'audioSessionReset',
+    listenerFunc: () => void,
+  ): Promise<PluginListenerHandle>;
+
+  /**
    * Remove all registered event listeners.
    *
    * This is useful for cleanup when your component unmounts or when you want to

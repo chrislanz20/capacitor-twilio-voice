@@ -1085,6 +1085,94 @@
         "slug": "addlistenerregistrationfailure-"
       },
       {
+        "name": "addListener",
+        "signature": "(eventName: 'audioSessionInterrupted', listenerFunc: (data: { type: 'began' | 'ended'; }) => void) => Promise<PluginListenerHandle>",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "- The event name ('audioSessionInterrupted')",
+            "type": "'audioSessionInterrupted'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "- 'began' when audio is taken, 'ended' when iOS says\nthe interruption is over. 'ended' does NOT guarantee audio is back.",
+            "type": "(data: { type: 'began' | 'ended'; }) => void"
+          }
+        ],
+        "returns": "Promise<PluginListenerHandle>",
+        "tags": [
+          {
+            "name": "param",
+            "text": "eventName - The event name ('audioSessionInterrupted')"
+          },
+          {
+            "name": "param",
+            "text": "listenerFunc - 'began' when audio is taken, 'ended' when iOS says\nthe interruption is over. 'ended' does NOT guarantee audio is back."
+          }
+        ],
+        "docs": "Fired when iOS interrupts the app's audio session, and again when the\ninterruption ends. An interruption is iOS handing the microphone to\nsomething else: an incoming cellular call, Siri, another app playing audio.\n\nThese have always been emitted and were never declared, so nothing could\nlisten to them in a type-safe way. Listen to them: an interruption that\nnever resolves leaves a call alive with dead audio in both directions and\nno other trace anywhere.",
+        "complexTypes": [
+          "PluginListenerHandle"
+        ],
+        "slug": "addlisteneraudiosessioninterrupted-"
+      },
+      {
+        "name": "addListener",
+        "signature": "(eventName: 'audioSessionResumed', listenerFunc: () => void) => Promise<PluginListenerHandle>",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "- The event name ('audioSessionResumed')",
+            "type": "'audioSessionResumed'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "",
+            "type": "() => void"
+          }
+        ],
+        "returns": "Promise<PluginListenerHandle>",
+        "tags": [
+          {
+            "name": "param",
+            "text": "eventName - The event name ('audioSessionResumed')"
+          }
+        ],
+        "docs": "Fired when the audio session was successfully reactivated after an\ninterruption. Not guaranteed to follow every 'ended' — iOS only offers a\nresume hint for some interruption types.",
+        "complexTypes": [
+          "PluginListenerHandle"
+        ],
+        "slug": "addlisteneraudiosessionresumed-"
+      },
+      {
+        "name": "addListener",
+        "signature": "(eventName: 'audioSessionReset', listenerFunc: () => void) => Promise<PluginListenerHandle>",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "- The event name ('audioSessionReset')",
+            "type": "'audioSessionReset'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "",
+            "type": "() => void"
+          }
+        ],
+        "returns": "Promise<PluginListenerHandle>",
+        "tags": [
+          {
+            "name": "param",
+            "text": "eventName - The event name ('audioSessionReset')"
+          }
+        ],
+        "docs": "Fired when iOS reset the media services and the audio session had to be\nrebuilt from scratch. Rare, and worth recording when it happens.",
+        "complexTypes": [
+          "PluginListenerHandle"
+        ],
+        "slug": "addlisteneraudiosessionreset-"
+      },
+      {
         "name": "removeAllListeners",
         "signature": "() => Promise<void>",
         "parameters": [],

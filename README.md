@@ -573,6 +573,9 @@ Common error scenarios:
 * [`addListener('callQualityWarningsChanged', ...)`](#addlistenercallqualitywarningschanged-)
 * [`addListener('registrationSuccess', ...)`](#addlistenerregistrationsuccess-)
 * [`addListener('registrationFailure', ...)`](#addlistenerregistrationfailure-)
+* [`addListener('audioSessionInterrupted', ...)`](#addlisteneraudiosessioninterrupted-)
+* [`addListener('audioSessionResumed', ...)`](#addlisteneraudiosessionresumed-)
+* [`addListener('audioSessionReset', ...)`](#addlisteneraudiosessionreset-)
 * [`removeAllListeners()`](#removealllisteners)
 * [`getPluginVersion()`](#getpluginversion)
 * [Interfaces](#interfaces)
@@ -1087,6 +1090,70 @@ Twilio service problems.
 | ------------------ | -------------------------------------------------- | ---------------------------------------- |
 | **`eventName`**    | <code>'registrationFailure'</code>                 | - The event name ('registrationFailure') |
 | **`listenerFunc`** | <code>(data: { error: string; }) =&gt; void</code> | - Callback function to handle the event  |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
+### addListener('audioSessionInterrupted', ...)
+
+```typescript
+addListener(eventName: 'audioSessionInterrupted', listenerFunc: (data: { type: 'began' | 'ended'; }) => void) => Promise<PluginListenerHandle>
+```
+
+Fired when iOS interrupts the app's audio session, and again when the
+interruption ends. An interruption is iOS handing the microphone to
+something else: an incoming cellular call, Siri, another app playing audio.
+
+These have always been emitted and were never declared, so nothing could
+listen to them in a type-safe way. Listen to them: an interruption that
+never resolves leaves a call alive with dead audio in both directions and
+no other trace anywhere.
+
+| Param              | Type                                                          | Description                                                                                                              |
+| ------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **`eventName`**    | <code>'audioSessionInterrupted'</code>                        | - The event name ('audioSessionInterrupted')                                                                             |
+| **`listenerFunc`** | <code>(data: { type: 'began' \| 'ended'; }) =&gt; void</code> | - 'began' when audio is taken, 'ended' when iOS says the interruption is over. 'ended' does NOT guarantee audio is back. |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
+### addListener('audioSessionResumed', ...)
+
+```typescript
+addListener(eventName: 'audioSessionResumed', listenerFunc: () => void) => Promise<PluginListenerHandle>
+```
+
+Fired when the audio session was successfully reactivated after an
+interruption. Not guaranteed to follow every 'ended' — iOS only offers a
+resume hint for some interruption types.
+
+| Param              | Type                               | Description                              |
+| ------------------ | ---------------------------------- | ---------------------------------------- |
+| **`eventName`**    | <code>'audioSessionResumed'</code> | - The event name ('audioSessionResumed') |
+| **`listenerFunc`** | <code>() =&gt; void</code>         |                                          |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
+### addListener('audioSessionReset', ...)
+
+```typescript
+addListener(eventName: 'audioSessionReset', listenerFunc: () => void) => Promise<PluginListenerHandle>
+```
+
+Fired when iOS reset the media services and the audio session had to be
+rebuilt from scratch. Rare, and worth recording when it happens.
+
+| Param              | Type                             | Description                            |
+| ------------------ | -------------------------------- | -------------------------------------- |
+| **`eventName`**    | <code>'audioSessionReset'</code> | - The event name ('audioSessionReset') |
+| **`listenerFunc`** | <code>() =&gt; void</code>       |                                        |
 
 **Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
 
