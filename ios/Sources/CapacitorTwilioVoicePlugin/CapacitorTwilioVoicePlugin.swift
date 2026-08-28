@@ -29,7 +29,7 @@ public protocol PushKitEventDelegate: AnyObject {
  */
 @objc(CapacitorTwilioVoicePlugin)
 public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEventDelegate {
-    private let pluginVersion: String = "8.2.1"
+    private let pluginVersion: String = "8.2.12-eskew.1"
 
     public let identifier = "CapacitorTwilioVoicePlugin"
     public let jsName = "CapacitorTwilioVoice"
@@ -61,6 +61,9 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     private var callKitProvider: CXProvider?
     private let callKitCallController = CXCallController()
     private let callObserver = CXCallObserver()
+    // True only while CallKit itself put the call on hold (an incoming cellular
+    // call). A hold the STAFFER set via holdCall() must never be auto-released.
+    private var heldByCallKit = false
     private var userInitiatedDisconnect: Bool = false
     private var audioDevice = DefaultAudioDevice()
     private var callKitCompletionCallback: ((Bool) -> Void)?
@@ -208,8 +211,11 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         NSLog("Media services were reset, reconfiguring audio session")
         setupAudioSession()
 
-        if let call = getActiveCall(), !call.isOnHold {
-            audioDevice.isEnabled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let call = self.getActiveCall(), !call.isOnHold {
+                self.audioDevice.isEnabled = true
+            }
         }
 
         notifyListeners("audioSessionReset", data: nil)
@@ -225,8 +231,14 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         switch type {
         case .began:
             NSLog("Audio session interruption began")
-            if activeCalls.isEmpty && activeCallInvites.isEmpty {
-                audioDevice.isEnabled = false
+            // activeCalls / activeCallInvites are mutated on main by the CallKit
+            // delegates and Swift dictionaries are not thread-safe; this
+            // notification arrives on an arbitrary thread.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if self.activeCalls.isEmpty && self.activeCallInvites.isEmpty {
+                    self.audioDevice.isEnabled = false
+                }
             }
             notifyListeners("audioSessionInterrupted", data: ["type": "began"])
 
@@ -1204,6 +1216,10 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
     }
 
     public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        // The one place audio genuinely comes back after an interruption. Upstream
+        // PR #66 removed the old emitter along with the .shouldResume branch, which
+        // left `audioSessionResumed` declared, listened for, and never fired.
+        notifyListeners("audioSessionResumed", data: nil)
         NSLog("CallKit activated audio session")
 
         do {
@@ -1314,6 +1330,7 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
 
     public func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
         if let call = activeCalls[action.callUUID.uuidString] {
+            heldByCallKit = action.isOnHold
             call.isOnHold = action.isOnHold
             if !call.isOnHold {
                 audioDevice.isEnabled = true
@@ -1351,6 +1368,10 @@ extension CapacitorTwilioVoicePlugin: CXCallObserverDelegate {
               call.uuid != voipCallUuid,
               callObserver.calls.count == 1,
               voipCall.isOnHold,
+              // Only undo a hold CallKit imposed. A staffer who tapped Hold
+              // must stay on hold — releasing it would put a client back
+              // through while they believe the line is parked.
+              heldByCallKit,
               callObserver.calls.first?.uuid == voipCallUuid else {
             return
         }
@@ -1372,6 +1393,7 @@ extension CapacitorTwilioVoicePlugin: CXCallObserverDelegate {
                 if let error = error {
                     NSLog("Failed to unhold VoIP call after external call ended: \(error.localizedDescription)")
                 } else {
+                    self.heldByCallKit = false
                     NSLog("Successfully unheld VoIP call after external call ended")
                 }
             }
