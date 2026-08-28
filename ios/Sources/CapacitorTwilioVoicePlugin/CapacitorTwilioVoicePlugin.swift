@@ -29,7 +29,7 @@ public protocol PushKitEventDelegate: AnyObject {
  */
 @objc(CapacitorTwilioVoicePlugin)
 public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEventDelegate {
-    private let pluginVersion: String = "8.2.1"
+    private let pluginVersion: String = "8.2.12-eskew.1"
 
     public let identifier = "CapacitorTwilioVoicePlugin"
     public let jsName = "CapacitorTwilioVoice"
@@ -60,6 +60,10 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     private var activeCall: Call?
     private var callKitProvider: CXProvider?
     private let callKitCallController = CXCallController()
+    private let callObserver = CXCallObserver()
+    // True only while CallKit itself put the call on hold (an incoming cellular
+    // call). A hold the STAFFER set via holdCall() must never be auto-released.
+    private var heldByCallKit = false
     private var userInitiatedDisconnect: Bool = false
     private var audioDevice = DefaultAudioDevice()
     private var callKitCompletionCallback: ((Bool) -> Void)?
@@ -100,6 +104,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         setupCallKit()
         setupAudioDevice()
         setupNotifications()
+        callObserver.setDelegate(self, queue: nil)
     }
 
     private func setupCallKit() {
@@ -120,8 +125,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             try audioSession.setCategory(.playAndRecord,
                                          mode: .voiceChat,
                                          options: [.allowBluetooth, .allowBluetoothA2DP, .allowAirPlay])
-            try audioSession.setActive(true)
-            NSLog("Audio session configured successfully")
+            NSLog("Audio session category configured")
         } catch {
             NSLog("Failed to configure audio session: \(error.localizedDescription)")
         }
@@ -207,10 +211,13 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         NSLog("Media services were reset, reconfiguring audio session")
         setupAudioSession()
 
-        // Re-enable audio device
-        audioDevice.isEnabled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if let call = self.getActiveCall(), !call.isOnHold {
+                self.audioDevice.isEnabled = true
+            }
+        }
 
-        // Notify listeners about the reset
         notifyListeners("audioSessionReset", data: nil)
     }
 
@@ -224,81 +231,20 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         switch type {
         case .began:
             NSLog("Audio session interruption began")
-            // Same main-thread confinement as the .ended branch below; the main
-            // queue is serial, so began/ended ordering is preserved.
+            // activeCalls / activeCallInvites are mutated on main by the CallKit
+            // delegates and Swift dictionaries are not thread-safe; this
+            // notification arrives on an arbitrary thread.
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                self.audioDevice.isEnabled = false
-                self.notifyListeners("audioSessionInterrupted", data: ["type": "began"])
+                if self.activeCalls.isEmpty && self.activeCallInvites.isEmpty {
+                    self.audioDevice.isEnabled = false
+                }
             }
+            notifyListeners("audioSessionInterrupted", data: ["type": "began"])
 
         case .ended:
             NSLog("Audio session interruption ended")
-
-            var options: AVAudioSession.InterruptionOptions = []
-            if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
-                options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-            }
-            let shouldResume = options.contains(.shouldResume)
-
-            // AVAudioSession posts this notification on a background thread. Hop to
-            // main before touching activeCalls/audioDevice so this can't race with
-            // CXProviderDelegate's audio writes (registered on the main queue via
-            // `provider.setDelegate(self, queue: nil)`).
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-
-                // iOS does NOT guarantee .shouldResume (especially with CallKit in
-                // play, or when the interruption came from another call/Siri/alarm).
-                // If a Twilio call is still connected and not on hold, trust the
-                // call's own state over the interruption flag and re-enable audio
-                // anyway -- otherwise the call stays silent until Twilio's media
-                // timeout eventually disconnects it (the confirmed field failure).
-                //
-                // Deliberately narrow: only calls that are .connected/.reconnecting
-                // AND not isOnHold qualify. A call put on hold via
-                // CXSetHeldCallAction (e.g. the user answered the interrupting
-                // cellular call with "Hold & Accept") must NOT have its audio
-                // force-enabled here -- that would fight CallKit, which hasn't
-                // reactivated the session for us yet, and risks latching the device
-                // "on" before it can actually produce audio.
-                let hasResumableCall = self.activeCalls.values.contains { call in
-                    !call.isOnHold && (call.state == .connected || call.state == .reconnecting)
-                }
-
-                guard shouldResume || hasResumableCall else {
-                    self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
-                    return
-                }
-
-                if !shouldResume {
-                    NSLog("Interruption ended without .shouldResume but a call is still active - resuming audio anyway")
-                }
-
-                do {
-                    try AVAudioSession.sharedInstance().setActive(true)
-                } catch {
-                    NSLog("Failed to reactivate audio session after interruption: \(error.localizedDescription)")
-                }
-
-                // Re-enable the Twilio audio device even if setActive threw above:
-                // enabling the device restarts its audio unit, which manages session
-                // activation itself. Leaving it disabled here is exactly the
-                // silent-call failure mode this fix targets. Force a false->true
-                // transition deliberately: per TVODefaultAudioDevice, isEnabled ==
-                // true is only a permission gate, not proof the audio unit is
-                // running -- a stalled unit with isEnabled latched true (e.g. an
-                // unhold that ran during the interruption) would never be restarted
-                // by a conditional set, leaving the call permanently silent. Worst
-                // case of the toggle is a sub-second audio unit rebuild, and this
-                // branch only runs after a genuine interruption ended with a
-                // resumable call.
-                self.audioDevice.isEnabled = false
-                self.audioDevice.isEnabled = true
-                NSLog("Audio session resumed after interruption")
-                self.notifyListeners("audioSessionResumed", data: nil)
-                self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
-            }
+            notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
 
         @unknown default:
             break
@@ -694,15 +640,6 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         }
 
         activeCall.isOnHold = held
-        if !held {
-            // Mirror the CXSetHeldCallAction unhold path: if an audio session
-            // interruption disabled the audio device while this call was held,
-            // flipping isOnHold alone leaves the call silent. Main-thread
-            // confined, consistent with the interruption handlers.
-            DispatchQueue.main.async { [weak self] in
-                self?.audioDevice.isEnabled = true
-            }
-        }
         call.resolve(["success": true])
     }
 
@@ -876,42 +813,14 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     private func toggleAudioRoute(toSpeaker: Bool) {
         audioDevice.block = {
             do {
-                let audioSession = AVAudioSession.sharedInstance()
-
-                // Ensure audio session is active before changing routing
-                if !audioSession.isOtherAudioPlaying {
-                    try audioSession.setActive(true)
-                }
-
                 if toSpeaker {
-                    try audioSession.overrideOutputAudioPort(.speaker)
+                    try AVAudioSession.sharedInstance().overrideOutputAudioPort(.speaker)
                 } else {
-                    try audioSession.overrideOutputAudioPort(.none)
+                    try AVAudioSession.sharedInstance().overrideOutputAudioPort(.none)
                 }
-
                 NSLog("Audio route changed to: \(toSpeaker ? "speaker" : "earpiece")")
             } catch {
                 NSLog("Failed to change audio route: \(error.localizedDescription)")
-
-                // Try to recover by reconfiguring the audio session
-                do {
-                    let audioSession = AVAudioSession.sharedInstance()
-                    try audioSession.setCategory(.playAndRecord,
-                                                 mode: .voiceChat,
-                                                 options: [.allowBluetooth, .allowBluetoothA2DP, .allowAirPlay])
-                    try audioSession.setActive(true)
-
-                    // Retry the audio route change
-                    if toSpeaker {
-                        try audioSession.overrideOutputAudioPort(.speaker)
-                    } else {
-                        try audioSession.overrideOutputAudioPort(.none)
-                    }
-
-                    NSLog("Audio route recovered and changed to: \(toSpeaker ? "speaker" : "earpiece")")
-                } catch {
-                    NSLog("Failed to recover audio route: \(error.localizedDescription)")
-                }
             }
         }
         audioDevice.block()
@@ -1307,19 +1216,22 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
     }
 
     public func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        // The one place audio genuinely comes back after an interruption. Upstream
+        // PR #66 removed the old emitter along with the .shouldResume branch, which
+        // left `audioSessionResumed` declared, listened for, and never fired.
+        notifyListeners("audioSessionResumed", data: nil)
         NSLog("CallKit activated audio session")
 
-        // Configure the audio session for VoIP calls
         do {
             try audioSession.setCategory(.playAndRecord,
                                          mode: .voiceChat,
                                          options: [.allowBluetooth, .allowBluetoothA2DP, .allowAirPlay])
-            audioDevice.isEnabled = true
-            NSLog("Audio session activated and configured for call")
         } catch {
             NSLog("Failed to configure audio session during activation: \(error.localizedDescription)")
-            audioDevice.isEnabled = true // Still try to enable the device
         }
+
+        audioDevice.isEnabled = true
+        NSLog("Audio device enabled after CallKit activation")
     }
 
     public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
@@ -1418,6 +1330,7 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
 
     public func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
         if let call = activeCalls[action.callUUID.uuidString] {
+            heldByCallKit = action.isOnHold
             call.isOnHold = action.isOnHold
             if !call.isOnHold {
                 audioDevice.isEnabled = true
@@ -1440,6 +1353,51 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
 
     public func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
         NSLog("Provider timed out performing action: \(action)")
+    }
+}
+
+
+// MARK: - CXCallObserverDelegate
+
+extension CapacitorTwilioVoicePlugin: CXCallObserverDelegate {
+    public func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        guard let voipCall = getActiveCall(),
+              let voipCallUuid = voipCall.uuid,
+              activeCalls[voipCallUuid.uuidString] != nil,
+              call.hasEnded,
+              call.uuid != voipCallUuid,
+              callObserver.calls.count == 1,
+              voipCall.isOnHold,
+              // Only undo a hold CallKit imposed. A staffer who tapped Hold
+              // must stay on hold — releasing it would put a client back
+              // through while they believe the line is parked.
+              heldByCallKit,
+              callObserver.calls.first?.uuid == voipCallUuid else {
+            return
+        }
+
+        NSLog("External call ended, scheduling VoIP call unhold")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self,
+                  let call = self.getActiveCall(),
+                  call.isOnHold,
+                  let uuid = call.uuid else {
+                return
+            }
+
+            let unholdAction = CXSetHeldCallAction(call: uuid, onHold: false)
+            let transaction = CXTransaction(action: unholdAction)
+
+            self.callKitCallController.request(transaction) { error in
+                if let error = error {
+                    NSLog("Failed to unhold VoIP call after external call ended: \(error.localizedDescription)")
+                } else {
+                    self.heldByCallKit = false
+                    NSLog("Successfully unheld VoIP call after external call ended")
+                }
+            }
+        }
     }
 }
 
