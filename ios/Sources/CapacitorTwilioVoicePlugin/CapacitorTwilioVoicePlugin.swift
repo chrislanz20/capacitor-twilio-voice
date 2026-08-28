@@ -224,81 +224,28 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         switch type {
         case .began:
             NSLog("Audio session interruption began")
-            // Same main-thread confinement as the .ended branch below; the main
-            // queue is serial, so began/ended ordering is preserved.
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.audioDevice.isEnabled = false
-                self.notifyListeners("audioSessionInterrupted", data: ["type": "began"])
-            }
+            audioDevice.isEnabled = false
+            notifyListeners("audioSessionInterrupted", data: ["type": "began"])
 
         case .ended:
             NSLog("Audio session interruption ended")
 
-            var options: AVAudioSession.InterruptionOptions = []
+            // Check if we should resume
             if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
-                options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                if options.contains(.shouldResume) {
+                    do {
+                        try AVAudioSession.sharedInstance().setActive(true)
+                        audioDevice.isEnabled = true
+                        NSLog("Audio session resumed after interruption")
+                        notifyListeners("audioSessionResumed", data: nil)
+                    } catch {
+                        NSLog("Failed to resume audio session: \(error.localizedDescription)")
+                    }
+                }
             }
-            let shouldResume = options.contains(.shouldResume)
 
-            // AVAudioSession posts this notification on a background thread. Hop to
-            // main before touching activeCalls/audioDevice so this can't race with
-            // CXProviderDelegate's audio writes (registered on the main queue via
-            // `provider.setDelegate(self, queue: nil)`).
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-
-                // iOS does NOT guarantee .shouldResume (especially with CallKit in
-                // play, or when the interruption came from another call/Siri/alarm).
-                // If a Twilio call is still connected and not on hold, trust the
-                // call's own state over the interruption flag and re-enable audio
-                // anyway -- otherwise the call stays silent until Twilio's media
-                // timeout eventually disconnects it (the confirmed field failure).
-                //
-                // Deliberately narrow: only calls that are .connected/.reconnecting
-                // AND not isOnHold qualify. A call put on hold via
-                // CXSetHeldCallAction (e.g. the user answered the interrupting
-                // cellular call with "Hold & Accept") must NOT have its audio
-                // force-enabled here -- that would fight CallKit, which hasn't
-                // reactivated the session for us yet, and risks latching the device
-                // "on" before it can actually produce audio.
-                let hasResumableCall = self.activeCalls.values.contains { call in
-                    !call.isOnHold && (call.state == .connected || call.state == .reconnecting)
-                }
-
-                guard shouldResume || hasResumableCall else {
-                    self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
-                    return
-                }
-
-                if !shouldResume {
-                    NSLog("Interruption ended without .shouldResume but a call is still active - resuming audio anyway")
-                }
-
-                do {
-                    try AVAudioSession.sharedInstance().setActive(true)
-                } catch {
-                    NSLog("Failed to reactivate audio session after interruption: \(error.localizedDescription)")
-                }
-
-                // Re-enable the Twilio audio device even if setActive threw above:
-                // enabling the device restarts its audio unit, which manages session
-                // activation itself. Leaving it disabled here is exactly the
-                // silent-call failure mode this fix targets. Force a false->true
-                // transition deliberately: per TVODefaultAudioDevice, isEnabled ==
-                // true is only a permission gate, not proof the audio unit is
-                // running -- a stalled unit with isEnabled latched true (e.g. an
-                // unhold that ran during the interruption) would never be restarted
-                // by a conditional set, leaving the call permanently silent. Worst
-                // case of the toggle is a sub-second audio unit rebuild, and this
-                // branch only runs after a genuine interruption ended with a
-                // resumable call.
-                self.audioDevice.isEnabled = false
-                self.audioDevice.isEnabled = true
-                NSLog("Audio session resumed after interruption")
-                self.notifyListeners("audioSessionResumed", data: nil)
-                self.notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
-            }
+            notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
 
         @unknown default:
             break
@@ -694,15 +641,6 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         }
 
         activeCall.isOnHold = held
-        if !held {
-            // Mirror the CXSetHeldCallAction unhold path: if an audio session
-            // interruption disabled the audio device while this call was held,
-            // flipping isOnHold alone leaves the call silent. Main-thread
-            // confined, consistent with the interruption handlers.
-            DispatchQueue.main.async { [weak self] in
-                self?.audioDevice.isEnabled = true
-            }
-        }
         call.resolve(["success": true])
     }
 
