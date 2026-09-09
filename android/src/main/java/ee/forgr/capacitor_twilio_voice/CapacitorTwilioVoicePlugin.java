@@ -243,7 +243,7 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
             // The CallInvite handed back here has been through an Intent, so it
             // is a different object to the one we stored — compare by CallSid,
             // never by identity.
-            removeInviteByCallSid(callInvite);
+            removeInviteByCallSid(callInvite.getCallSid());
             dismissIncomingCallNotification();
         }
     };
@@ -1843,15 +1843,20 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
      * also what JavaScript is given and hands back to acceptCall/rejectCall), so
      * the Twilio CallSid is NOT the key and Map.remove(callSid) silently does
      * nothing, leaving a phantom entry in getCallStatus() that never expires.
-     * Anything holding a CallInvite — which after a trip through an Intent is a
-     * DIFFERENT object to the one stored — must match on CallSid.
+     * Takes the SID, not an invite object, on purpose: the accept path holds a
+     * CallInvite while the cancel path holds a CancelledCallInvite, and those
+     * are unrelated Twilio types that share no supertype — passing the object
+     * would not compile for one of the two callers. (It did not: the first
+     * version of this took a CallInvite and the Android build failed with
+     * "incompatible types: CancelledCallInvite cannot be converted to
+     * CallInvite".) An invite that has been through an Intent is also a
+     * DIFFERENT object to the one stored, so identity comparison is wrong here
+     * regardless — the SID is the only thing that travels.
      *
      * @return the map key that was removed, or null if it was not there.
      */
-    private String removeInviteByCallSid(CallInvite invite) {
-        if (invite == null) return null;
-        String sid = invite.getCallSid();
-        if (sid == null) return null;
+    private String removeInviteByCallSid(String sid) {
+        if (sid == null || sid.isEmpty()) return null;
         for (Map.Entry<String, CallInvite> entry : activeCallInvites.entrySet()) {
             CallInvite stored = entry.getValue();
             if (stored != null && sid.equals(stored.getCallSid())) {
@@ -1914,7 +1919,7 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
         dismissIncomingCallNotification();
 
         // Find and remove the corresponding call invite
-        String cancelledCallSid = removeInviteByCallSid(cancelledCallInvite);
+        String cancelledCallSid = removeInviteByCallSid(cancelledCallInvite.getCallSid());
 
         if (cancelledCallSid != null) {
 
