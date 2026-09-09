@@ -60,6 +60,7 @@ import com.twilio.voice.Voice;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Set;
 import java.util.UUID;
 import org.json.JSONException;
@@ -87,7 +88,12 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
 
     private String accessToken;
     private String fcmToken;
-    private Map<String, CallInvite> activeCallInvites = new HashMap<>();
+    // ConcurrentHashMap, not HashMap: put() happens on the FCM/Voice callback
+    // thread (handleCallInvite) while the main thread reads, removes and now
+    // ITERATES it (removeInviteByCallSid). A plain HashMap can throw
+    // ConcurrentModificationException or corrupt on that pattern. Values are
+    // never null, so ConcurrentHashMap is a drop-in here.
+    private Map<String, CallInvite> activeCallInvites = new ConcurrentHashMap<>();
     private Map<String, Call> activeCalls = new HashMap<>();
     private Map<UUID, Call> callsByUuid = new HashMap<>();
     private Call activeCall;
@@ -224,8 +230,20 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
 
         @Override
         public void onCallInviteAccepted(CallInvite callInvite) {
-            // Remove from active invites since it's now being handled by the service
-            activeCallInvites.remove(callInvite.getCallSid());
+            // Remove from active invites since it's now being handled by the service.
+            //
+            // 🔴 activeCallInvites is keyed by a random UUID we mint in
+            // handleCallInvite, NOT by Twilio's CallSid, so removing by
+            // getCallSid() never matched and every answered invite stayed in the
+            // map forever — reported by getCallStatus() as a phantom pending
+            // ring, and growing for the life of the process. (It does NOT make
+            // the app reject the next caller: the JS busy-guard reads its own
+            // state, not this map.) Look the entry up by CallSid instead.
+            //
+            // The CallInvite handed back here has been through an Intent, so it
+            // is a different object to the one we stored — compare by CallSid,
+            // never by identity.
+            removeInviteByCallSid(callInvite);
             dismissIncomingCallNotification();
         }
     };
@@ -539,6 +557,26 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
             return;
         }
 
+        // Stop the ring HERE, on the tap, the same way rejectCall does.
+        //
+        // This used to depend on the service calling back into
+        // onCallInviteAccepted, which only happens when the plugin is bound to
+        // VoiceCallService. When it is not, the looping ringtone started in
+        // handleCallInvite (setLooping(true)) simply never stops: the person
+        // answers and their own phone keeps ringing through the whole call,
+        // with the incoming-call notification still up so they cannot dismiss
+        // it until they hang up. Reported by a firm, Sep 2026.
+        //
+        // Answering on ANOTHER device was never affected, because Twilio's
+        // cancel runs onCallInviteCancelled, which does dismiss — which is why
+        // this only ever showed up when the answer happened on the handset.
+        //
+        // Safe to do before the accept lands: the person has tapped answer, so
+        // the ring is over either way, and dismissIncomingCallNotification is
+        // idempotent (stopRingtone null-guards, cancel() on an absent
+        // notification is a no-op).
+        dismissIncomingCallNotification();
+
         Intent serviceIntent = new Intent(getSafeContext(), VoiceCallService.class);
         serviceIntent.setAction(VoiceCallService.ACTION_ACCEPT_CALL);
         serviceIntent.putExtra(VoiceCallService.EXTRA_CALL_INVITE, callInvite);
@@ -547,6 +585,17 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
         try {
             getSafeContext().startForegroundService(serviceIntent);
             Log.d(TAG, "Call acceptance started via service (permission granted)");
+
+            // Drop the invite HERE, by its map key, for the same reason the
+            // dismiss above moved here: onCallInviteAccepted only runs when the
+            // plugin is bound to VoiceCallService, so relying on it to clean up
+            // leaves the entry behind in exactly the case this fix is about.
+            // Nothing reads an accepted invite afterwards — acceptCall,
+            // rejectCall, acceptCallFromNotification, rejectCallFromNotification
+            // and handlePermissionFailure all run BEFORE the accept, and the
+            // service holds its own copy handed over in the Intent. Leaving it
+            // in would keep reporting a phantom ring in getCallStatus().
+            activeCallInvites.remove(callSid);
         } catch (Exception e) {
             Log.e(TAG, "Error accepting call via service", e);
         } finally {
@@ -1787,6 +1836,33 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
         }
     }
 
+    /**
+     * Drop an invite from activeCallInvites, looked up by Twilio's CallSid.
+     *
+     * The map is keyed by a random UUID minted in handleCallInvite (that UUID is
+     * also what JavaScript is given and hands back to acceptCall/rejectCall), so
+     * the Twilio CallSid is NOT the key and Map.remove(callSid) silently does
+     * nothing, leaving a phantom entry in getCallStatus() that never expires.
+     * Anything holding a CallInvite — which after a trip through an Intent is a
+     * DIFFERENT object to the one stored — must match on CallSid.
+     *
+     * @return the map key that was removed, or null if it was not there.
+     */
+    private String removeInviteByCallSid(CallInvite invite) {
+        if (invite == null) return null;
+        String sid = invite.getCallSid();
+        if (sid == null) return null;
+        for (Map.Entry<String, CallInvite> entry : activeCallInvites.entrySet()) {
+            CallInvite stored = entry.getValue();
+            if (stored != null && sid.equals(stored.getCallSid())) {
+                String key = entry.getKey();
+                activeCallInvites.remove(key);
+                return key;
+            }
+        }
+        return null;
+    }
+
     private void dismissIncomingCallNotification() {
         try {
             NotificationManagerCompat notificationManager = NotificationManagerCompat.from(getSafeContext());
@@ -1838,17 +1914,9 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
         dismissIncomingCallNotification();
 
         // Find and remove the corresponding call invite
-        String cancelledCallSid = null;
-        for (Map.Entry<String, CallInvite> entry : activeCallInvites.entrySet()) {
-            CallInvite invite = entry.getValue();
-            if (invite.getCallSid().equals(cancelledCallInvite.getCallSid())) {
-                cancelledCallSid = entry.getKey();
-                break;
-            }
-        }
+        String cancelledCallSid = removeInviteByCallSid(cancelledCallInvite);
 
         if (cancelledCallSid != null) {
-            activeCallInvites.remove(cancelledCallSid);
 
             JSObject data = new JSObject();
             data.put("callSid", cancelledCallSid);
