@@ -1401,18 +1401,24 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
             CallInvite callInvite = entry.getValue();
 
             Map<String, String> params = callInvite.getCustomParameters();
+
+            // `from` is ALWAYS the real From (number or client identity) — the
+            // web layer looks callers up by it and correlates rings by it. The
+            // display name travels separately as `callerName`, matching iOS.
+            // Before this, a CapacitorTwilioCallerName replaced `from`, so the
+            // number was lost to JS the moment a name was sent.
+            String fromValue = callInvite.getFrom();
+            if (fromValue != null && fromValue.startsWith("client:")) {
+                fromValue = fromValue.substring(7); // Remove "client:" prefix
+            }
             String callerName = params.containsKey("CapacitorTwilioCallerName")
                 ? params.get("CapacitorTwilioCallerName")
-                : callInvite.getFrom();
-
-            // Strip "client:" prefix from caller name for consistency
-            if (callerName != null && callerName.startsWith("client:")) {
-                callerName = callerName.substring(7); // Remove "client:" prefix
-            }
+                : fromValue;
 
             JSObject inviteData = new JSObject();
             inviteData.put("callSid", callSid);
-            inviteData.put("from", callerName);
+            inviteData.put("from", fromValue);
+            inviteData.put("callerName", callerName);
             inviteData.put("to", callInvite.getTo());
             inviteData.put("customParams", new JSONObject(params));
 
@@ -1887,25 +1893,30 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
         activeCallInvites.put(callSid, callInvite);
 
         Map<String, String> params = callInvite.getCustomParameters();
+
+        // `from` is ALWAYS the real From (number or client identity) — the web
+        // layer looks callers up by it and correlates rings by it. The display
+        // name travels separately as `callerName`, matching iOS. Before this, a
+        // CapacitorTwilioCallerName replaced `from`, so the number was lost to
+        // JS the moment a name was sent.
+        String fromValue = callInvite.getFrom();
+        if (fromValue != null && fromValue.startsWith("client:")) {
+            fromValue = fromValue.substring(7); // Remove "client:" prefix
+        }
         String callerName = params.containsKey("CapacitorTwilioCallerName")
             ? params.get("CapacitorTwilioCallerName")
-            : callInvite.getFrom();
+            : fromValue;
 
-        // Create and show notification
+        // Create and show notification (the name is what the person sees)
         showIncomingCallNotification(callInvite, callSid, callerName);
 
         // Start ringtone and vibration
         startRingtone();
 
-        // Strip "client:" prefix from caller name for consistency
-        String fromValue = callerName;
-        if (fromValue != null && fromValue.startsWith("client:")) {
-            fromValue = fromValue.substring(7); // Remove "client:" prefix
-        }
-
         JSObject data = new JSObject();
         data.put("callSid", callSid);
         data.put("from", fromValue);
+        data.put("callerName", callerName);
         data.put("to", callInvite.getTo());
         data.put("customParams", new JSONObject(params));
         notifyListeners("callInviteReceived", data);

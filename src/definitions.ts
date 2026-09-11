@@ -52,8 +52,14 @@
 export interface CallInvite {
   /** Unique identifier for the incoming call invitation */
   callSid: string;
-  /** Phone number or client identifier of the caller (may include custom caller name) */
+  /** Phone number or client identifier of the caller. ALWAYS the real From — never a display name. */
   from: string;
+  /**
+   * What to show for the caller: the `CapacitorTwilioCallerName` custom
+   * parameter when the call carried one, otherwise the same value as `from`.
+   * Native ring surfaces (CallKit, the Android call notification) show this.
+   */
+  callerName?: string;
   /** Phone number or client identifier being called */
   to: string;
   /** Custom parameters passed with the call invitation */
