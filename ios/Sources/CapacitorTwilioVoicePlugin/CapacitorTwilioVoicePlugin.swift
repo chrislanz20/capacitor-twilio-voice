@@ -708,9 +708,13 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             let from = (callInvite.from ?? "Unknown").replacingOccurrences(of: "client:", with: "")
             let niceName = callInvite.customParameters?["CapacitorTwilioCallerName"] ?? from
 
+            // `from` stays the real From; the display name rides separately
+            // (same shape as callInviteReceived). Swapping the name into `from`
+            // lost the number to JS the moment a name was sent.
             pendingInvitesArray.append([
                 "callSid": callSid,
-                "from": niceName,
+                "from": from,
+                "callerName": niceName,
                 "to": callInvite.to,
                 "customParams": callInvite.customParameters ?? [:]
             ])
@@ -1080,6 +1084,7 @@ extension CapacitorTwilioVoicePlugin: NotificationDelegate {
         notifyListeners("callInviteReceived", data: [
             "callSid": callInvite.uuid.uuidString,
             "from": from,
+            "callerName": niceName,
             "to": callInvite.to,
             "customParams": callInvite.customParameters ?? [:]
         ])
