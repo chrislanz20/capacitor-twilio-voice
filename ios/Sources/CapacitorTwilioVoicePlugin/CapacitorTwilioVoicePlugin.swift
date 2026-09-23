@@ -68,6 +68,9 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     // Set when iOS itself asks to end a call (CXEndCallAction we did not start).
     // Reported with callDisconnected so a dropped call says WHO ended it.
     private var systemEndRequested: Bool = false
+    // A hold the APP asked for (not iOS for another call). Only a CallKit-imposed
+    // hold may be lifted automatically when the other call ends.
+    private var appHoldRequested: Bool = false
     private var audioDevice = DefaultAudioDevice()
     private var callKitCompletionCallback: ((Bool) -> Void)?
     private var playCustomRingback = false
@@ -645,12 +648,25 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             targetCall = getActiveCall()
         }
 
-        guard let activeCall = targetCall else {
+        guard let activeCall = targetCall, let uuid = activeCall.uuid else {
             call.reject("No active call found")
             return
         }
 
-        activeCall.isMuted = muted
+        // Through CallKit, not straight onto the call: then the iPhone's own call
+        // screen, AirPods and the Watch all agree with the app, and the ONE place
+        // mute changes (the CXSetMutedCallAction delegate) tells the app. Setting
+        // it directly left the system screen saying the opposite.
+        let transaction = CXTransaction(action: CXSetMutedCallAction(call: uuid, muted: muted))
+        callKitCallController.request(transaction) { [weak self] error in
+            if let error = error {
+                NSLog("CXSetMutedCallAction failed, setting directly: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    activeCall.isMuted = muted
+                    self?.notifyListeners("callMuteChanged", data: ["callSid": uuid.uuidString, "muted": muted])
+                }
+            }
+        }
         call.resolve(["success": true])
     }
 
@@ -669,12 +685,27 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             targetCall = getActiveCall()
         }
 
-        guard let activeCall = targetCall else {
+        guard let activeCall = targetCall, let uuid = activeCall.uuid else {
             call.reject("No active call found")
             return
         }
 
-        activeCall.isOnHold = held
+        // Through CallKit for the same reason as mute. Marked as the app's own
+        // hold so an ending cellular call never lifts a hold the staffer chose.
+        appHoldRequested = true
+        let transaction = CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: held))
+        callKitCallController.request(transaction) { [weak self] error in
+            if let error = error {
+                NSLog("CXSetHeldCallAction failed, setting directly: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self?.appHoldRequested = false
+                    self?.heldByCallKit = false
+                    activeCall.isOnHold = held
+                    if !held { self?.audioDevice.isEnabled = true }
+                    self?.notifyListeners("callHoldChanged", data: ["callSid": uuid.uuidString, "onHold": held, "byApp": true])
+                }
+            }
+        }
         call.resolve(["success": true])
     }
 
@@ -759,6 +790,9 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             "hasActiveCall": hasActiveCall,
             "isOnHold": isOnHold,
             "isMuted": isMuted,
+            // Where the sound really goes right now, so a screen that restarted
+            // mid-call shows the true speaker state instead of guessing "off".
+            "isSpeaker": AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInSpeaker },
             "callSid": callSid as Any,
             "callState": callState,
             "pendingInvites": pendingInvitesArray,
@@ -1378,14 +1412,20 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
 
     public func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
         if let call = activeCalls[action.callUUID.uuidString] {
-            heldByCallKit = action.isOnHold
+            let byApp = appHoldRequested
+            appHoldRequested = false
+            heldByCallKit = action.isOnHold && !byApp
             call.isOnHold = action.isOnHold
             if !call.isOnHold {
                 audioDevice.isEnabled = true
                 activeCall = call
             }
             action.fulfill()
+            // The one place hold changes, whoever asked (app button, iOS for a
+            // second call, the system call screen): the app's button follows it.
+            notifyListeners("callHoldChanged", data: ["callSid": action.callUUID.uuidString, "onHold": action.isOnHold, "byApp": byApp])
         } else {
+            appHoldRequested = false
             action.fail()
         }
     }
@@ -1394,6 +1434,9 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
         if let call = activeCalls[action.callUUID.uuidString] {
             call.isMuted = action.isMuted
             action.fulfill()
+            // Whoever muted (app, system call screen, AirPods, Watch), the app's
+            // Mute button follows the call's real state.
+            notifyListeners("callMuteChanged", data: ["callSid": action.callUUID.uuidString, "muted": action.isMuted])
         } else {
             action.fail()
         }
