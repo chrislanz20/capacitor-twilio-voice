@@ -65,6 +65,9 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     // call). A hold the STAFFER set via holdCall() must never be auto-released.
     private var heldByCallKit = false
     private var userInitiatedDisconnect: Bool = false
+    // Set when iOS itself asks to end a call (CXEndCallAction we did not start).
+    // Reported with callDisconnected so a dropped call says WHO ended it.
+    private var systemEndRequested: Bool = false
     private var audioDevice = DefaultAudioDevice()
     private var callKitCompletionCallback: ((Bool) -> Void)?
     private var playCustomRingback = false
@@ -167,6 +170,29 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
 
     @objc private func handleAudioRouteChange(notification: Notification) {
         updateProximityMonitoring()
+        // What iOS actually did to the sound, not what the app asked for. A
+        // speaker that "turns itself off" mid-call shows up here with the
+        // reason iOS gave (another app, a call, a headset, an override).
+        let reasonValue = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.portType.rawValue }
+        notifyListeners("audioRouteChanged", data: [
+            "reason": routeChangeReasonString(reasonValue),
+            "outputs": outputs.joined(separator: ","),
+            "hasActiveCall": !activeCalls.isEmpty
+        ])
+    }
+
+    private func routeChangeReasonString(_ value: UInt) -> String {
+        switch AVAudioSession.RouteChangeReason(rawValue: value) {
+        case .newDeviceAvailable: return "new-device"
+        case .oldDeviceUnavailable: return "device-gone"
+        case .categoryChange: return "category-change"
+        case .override: return "override"
+        case .wakeFromSleep: return "wake"
+        case .noSuitableRouteForCategory: return "no-route"
+        case .routeConfigurationChange: return "config-change"
+        default: return "unknown-\(value)"
+        }
     }
 
     /// True only when audio is coming out of the earpiece the user holds to their
@@ -231,6 +257,9 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         switch type {
         case .began:
             NSLog("Audio session interruption began")
+            var began: [String: Any] = ["type": "began", "hasActiveCall": !activeCalls.isEmpty]
+            if let reason = userInfo[AVAudioSessionInterruptionReasonKey] as? UInt { began["reason"] = reason }
+            notifyListeners("audioSessionInterruptionDetail", data: began)
             // activeCalls / activeCallInvites are mutated on main by the CallKit
             // delegates and Swift dictionaries are not thread-safe; this
             // notification arrives on an arbitrary thread.
@@ -244,6 +273,12 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
 
         case .ended:
             NSLog("Audio session interruption ended")
+            let opts = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0
+            notifyListeners("audioSessionInterruptionDetail", data: [
+                "type": "ended",
+                "shouldResume": AVAudioSession.InterruptionOptions(rawValue: opts).contains(.shouldResume),
+                "hasActiveCall": !activeCalls.isEmpty
+            ])
             notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
 
         @unknown default:
@@ -1065,7 +1100,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         case .highPacketsLostFraction: return "high-packets-lost-fraction"
         case .lowMos: return "low-mos"
         case .constantAudioInputLevel: return "constant-audio-input-level"
-        default: return "unknown-warning"
+        default: return "unknown-warning-\(warning.rawValue)"
         }
     }
 }
@@ -1183,7 +1218,11 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
         }
 
         activeCalls.removeValue(forKey: call.uuid!.uuidString)
+        // Who ended it: the app's End button, iOS / the system call screen, or
+        // the far side / the network (neither of ours asked).
+        let endedBy = userInitiatedDisconnect ? "app" : (systemEndRequested ? "system" : "remote-or-network")
         userInitiatedDisconnect = false
+        systemEndRequested = false
 
         if playCustomRingback {
             stopRingback()
@@ -1195,7 +1234,8 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
 
         notifyListeners("callDisconnected", data: [
             "callSid": call.uuid!.uuidString,
-            "error": error?.localizedDescription as Any
+            "error": error?.localizedDescription as Any,
+            "endedBy": endedBy
         ])
     }
 
@@ -1328,6 +1368,9 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
                 "reason": "user_declined"
             ])
         } else if let call = activeCalls[action.callUUID.uuidString] {
+            // Not started by endCall() from the app: iOS itself (or the user on
+            // the system call screen / a headset button) asked to end it.
+            if !userInitiatedDisconnect { systemEndRequested = true }
             call.disconnect()
         }
         action.fulfill()
