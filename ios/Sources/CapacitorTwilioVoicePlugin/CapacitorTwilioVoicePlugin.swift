@@ -790,6 +790,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
             "hasActiveCall": hasActiveCall,
             "isOnHold": isOnHold,
             "isMuted": isMuted,
+            "twilioCallSid": activeCall?.sid ?? "",
             // Where the sound really goes right now, so a screen that restarted
             // mid-call shows the true speaker state instead of guessing "off".
             "isSpeaker": AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInSpeaker },
@@ -1204,7 +1205,10 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
         // Don't force speaker on - maintain current audio routing preference
         // toggleAudioRoute(toSpeaker: true) // Removed - this was forcing speaker on
         updateProximityMonitoring()
-        notifyListeners("callConnected", data: ["callSid": call.uuid!.uuidString])
+        // twilioSid: the CA… id the server knows. callSid stays the CallKit UUID
+        // the rest of the plugin API expects. Without it the server could not
+        // tell which call a phone meant (Transfer/Park took the newest one).
+        notifyListeners("callConnected", data: ["callSid": call.uuid!.uuidString, "twilioSid": call.sid])
     }
 
     public func callIsReconnecting(call: Call, error: Error) {
@@ -1257,6 +1261,8 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
         let endedBy = userInitiatedDisconnect ? "app" : (systemEndRequested ? "system" : "remote-or-network")
         userInitiatedDisconnect = false
         systemEndRequested = false
+        heldByCallKit = false
+        appHoldRequested = false
 
         if playCustomRingback {
             stopRingback()
@@ -1268,6 +1274,7 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
 
         notifyListeners("callDisconnected", data: [
             "callSid": call.uuid!.uuidString,
+            "twilioSid": call.sid,
             "error": error?.localizedDescription as Any,
             "endedBy": endedBy
         ])
@@ -1414,7 +1421,11 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
         if let call = activeCalls[action.callUUID.uuidString] {
             let byApp = appHoldRequested
             appHoldRequested = false
-            heldByCallKit = action.isOnHold && !byApp
+            // Only a hold iOS imposed on a call that was NOT already held may be
+            // lifted automatically later. A call the staffer held first, then
+            // "Hold & Accept" on a cell call, must stay held when that call ends.
+            let wasHeld = call.isOnHold
+            heldByCallKit = action.isOnHold && !byApp && !wasHeld
             call.isOnHold = action.isOnHold
             if !call.isOnHold {
                 audioDevice.isEnabled = true

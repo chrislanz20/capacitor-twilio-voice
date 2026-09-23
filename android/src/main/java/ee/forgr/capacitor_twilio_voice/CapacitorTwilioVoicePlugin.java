@@ -1359,6 +1359,59 @@ public class CapacitorTwilioVoicePlugin extends Plugin {
         }
     }
 
+    // The Twilio call this request is about: the one named, else the active one.
+    private Call targetCall(PluginCall call) {
+        String sid = call.getString("callSid");
+        if (sid != null && activeCalls.containsKey(sid)) return activeCalls.get(sid);
+        return activeCall;
+    }
+
+    // Hold and the keypad did not exist on Android: the app showed "On Hold"
+    // (and typed digits as sent) while the caller still heard everything and
+    // the phone menu got nothing. Both now act on the real Twilio call.
+    @PluginMethod
+    public void holdCall(PluginCall call) {
+        Boolean hold = call.getBoolean("hold");
+        if (hold == null) { call.reject("hold parameter is required"); return; }
+        Call target = targetCall(call);
+        if (target == null) { call.reject("No active call found"); return; }
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            try {
+                target.hold(hold);
+                JSObject evt = new JSObject();
+                evt.put("callSid", target.getSid());
+                evt.put("onHold", target.isOnHold());
+                evt.put("byApp", true);
+                notifyListeners("callHoldChanged", evt);
+                JSObject ret = new JSObject();
+                ret.put("success", true);
+                call.resolve(ret);
+            } catch (Exception e) {
+                Log.e(TAG, "Error holding call", e);
+                call.reject("Failed to hold call: " + e.getMessage());
+            }
+        });
+    }
+
+    @PluginMethod
+    public void sendDigits(PluginCall call) {
+        String digits = call.getString("digits");
+        if (digits == null || digits.isEmpty()) { call.reject("digits parameter is required"); return; }
+        Call target = targetCall(call);
+        if (target == null) { call.reject("No active call found"); return; }
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            try {
+                target.sendDigits(digits);
+                JSObject ret = new JSObject();
+                ret.put("success", true);
+                call.resolve(ret);
+            } catch (Exception e) {
+                Log.e(TAG, "Error sending digits", e);
+                call.reject("Failed to send digits: " + e.getMessage());
+            }
+        });
+    }
+
     @PluginMethod
     public void setSpeaker(PluginCall call) {
         boolean enabled = call.getBoolean("enabled", false);
