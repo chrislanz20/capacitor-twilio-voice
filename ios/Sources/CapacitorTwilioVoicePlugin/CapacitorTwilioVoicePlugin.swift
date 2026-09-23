@@ -178,11 +178,17 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         // reason iOS gave (another app, a call, a headset, an override).
         let reasonValue = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.portType.rawValue }
-        notifyListeners("audioRouteChanged", data: [
-            "reason": routeChangeReasonString(reasonValue),
-            "outputs": outputs.joined(separator: ","),
-            "hasActiveCall": !activeCalls.isEmpty
-        ])
+        // activeCalls belongs to the main thread (CallKit changes it there) and
+        // this notice arrives on a background one: read it on main, as
+        // updateProximityMonitoring does, or two threads touch it at once.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.notifyListeners("audioRouteChanged", data: [
+                "reason": self.routeChangeReasonString(reasonValue),
+                "outputs": outputs.joined(separator: ","),
+                "hasActiveCall": !self.activeCalls.isEmpty
+            ])
+        }
     }
 
     private func routeChangeReasonString(_ value: UInt) -> String {
@@ -260,9 +266,13 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         switch type {
         case .began:
             NSLog("Audio session interruption began")
-            var began: [String: Any] = ["type": "began", "hasActiveCall": !activeCalls.isEmpty]
-            if let reason = userInfo[AVAudioSessionInterruptionReasonKey] as? UInt { began["reason"] = reason }
-            notifyListeners("audioSessionInterruptionDetail", data: began)
+            let reason = userInfo[AVAudioSessionInterruptionReasonKey] as? UInt
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                var began: [String: Any] = ["type": "began", "hasActiveCall": !self.activeCalls.isEmpty]
+                if let reason = reason { began["reason"] = reason }
+                self.notifyListeners("audioSessionInterruptionDetail", data: began)
+            }
             // activeCalls / activeCallInvites are mutated on main by the CallKit
             // delegates and Swift dictionaries are not thread-safe; this
             // notification arrives on an arbitrary thread.
@@ -277,11 +287,15 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         case .ended:
             NSLog("Audio session interruption ended")
             let opts = (userInfo[AVAudioSessionInterruptionOptionKey] as? UInt) ?? 0
-            notifyListeners("audioSessionInterruptionDetail", data: [
-                "type": "ended",
-                "shouldResume": AVAudioSession.InterruptionOptions(rawValue: opts).contains(.shouldResume),
-                "hasActiveCall": !activeCalls.isEmpty
-            ])
+            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: opts).contains(.shouldResume)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.notifyListeners("audioSessionInterruptionDetail", data: [
+                    "type": "ended",
+                    "shouldResume": shouldResume,
+                    "hasActiveCall": !self.activeCalls.isEmpty
+                ])
+            }
             notifyListeners("audioSessionInterrupted", data: ["type": "ended"])
 
         @unknown default:
