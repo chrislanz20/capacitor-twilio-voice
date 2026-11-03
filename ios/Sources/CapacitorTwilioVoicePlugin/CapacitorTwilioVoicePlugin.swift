@@ -90,8 +90,19 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     // call stays silent both ways and nothing recorded it. The watchdog reads the
     // call's own audio levels after it connects and turns the audio back on.
     private var audioSessionActive = false
-    private var audioWatchdogToken = 0
-    private var audioWatchdogRestarts = 0
+    // Per call (CallKit UUID): a call ending must never cancel another call's checks.
+    private var watchdogTokens: [UUID: Int] = [:]
+    private var watchdogRestarts: [UUID: Int] = [:]
+    private var watchdogLastDead: [UUID: Bool] = [:]
+    private var watchdogLastPacketsSent: [UUID: Int] = [:]
+    private var callConnectedAt: [UUID: Date] = [:]
+    // When iOS (not the app's button) put a call on hold. Only a hold that came
+    // right at connect is the stuck-hold failure; a later one may be the staffer
+    // tapping Hold on the iOS call screen, a Watch or CarPlay, and is never lifted.
+    private var callKitHoldAt: [UUID: Date] = [:]
+    // The speaker choice the app last asked for. A dead call's session route can't
+    // be trusted to say what the staffer chose.
+    private var lastSpeakerChoice = false
     // Every CallKit call this plugin reported, so a stale one of OURS that iOS
     // still thinks is live (it holds the next call) can be told apart from a
     // real cellular call, which must never be touched.
@@ -912,6 +923,7 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     }
 
     private func toggleAudioRoute(toSpeaker: Bool) {
+        lastSpeakerChoice = toSpeaker
         audioDevice.block = {
             do {
                 if toSpeaker {
@@ -1285,8 +1297,8 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
         }
 
         activeCalls.removeValue(forKey: call.uuid!.uuidString)
-        // Any pending watchdog check belongs to a call that is gone.
-        audioWatchdogToken += 1
+        // Pending watchdog checks for THIS call stop; other calls keep theirs.
+        if let gone = call.uuid { clearAudioWatchdog(for: gone) }
         // Who ended it: the app's End button, iOS / the system call screen, or
         // the far side / the network (neither of ours asked).
         let endedBy = userInitiatedDisconnect ? "app" : (systemEndRequested ? "system" : "remote-or-network")
@@ -1326,27 +1338,49 @@ extension CapacitorTwilioVoicePlugin: CallDelegate {
 // MARK: - Dead-audio watchdog
 
 extension CapacitorTwilioVoicePlugin {
-    // Checks at about 2s, 4s and 6s after connect. Two restarts at most per call.
-    private static let audioWatchdogDelays: [Double] = [2.0, 2.0, 2.0]
+    // Checks at about 2, 4, 6 and 8 seconds after connect.
+    private static let audioWatchdogRounds = 4
+    private static let audioWatchdogInterval: Double = 2.0
     private static let audioWatchdogMaxRestarts = 2
+    // The stuck holds seen were 0.7s after connect; a person cannot tap Hold that fast.
+    private static let stuckHoldWindow: TimeInterval = 1.5
+
+    func currentTwilioSid() -> String? {
+        if let call = activeCall { return call.sid }
+        if activeCalls.count == 1 { return activeCalls.first?.value.sid }
+        return nil
+    }
 
     func startAudioWatchdog(for call: Call) {
-        audioWatchdogToken += 1
-        audioWatchdogRestarts = 0
         guard let uuid = call.uuid else { return }
-        scheduleAudioWatchdogCheck(token: audioWatchdogToken, uuid: uuid, round: 0)
+        let token = (watchdogTokens[uuid] ?? 0) + 1
+        watchdogTokens[uuid] = token
+        watchdogRestarts[uuid] = 0
+        watchdogLastDead[uuid] = false
+        watchdogLastPacketsSent.removeValue(forKey: uuid)
+        callConnectedAt[uuid] = Date()
+        scheduleAudioWatchdogCheck(token: token, uuid: uuid, round: 0)
+    }
+
+    func clearAudioWatchdog(for uuid: UUID) {
+        watchdogTokens.removeValue(forKey: uuid)
+        watchdogRestarts.removeValue(forKey: uuid)
+        watchdogLastDead.removeValue(forKey: uuid)
+        watchdogLastPacketsSent.removeValue(forKey: uuid)
+        callConnectedAt.removeValue(forKey: uuid)
+        callKitHoldAt.removeValue(forKey: uuid)
     }
 
     private func scheduleAudioWatchdogCheck(token: Int, uuid: UUID, round: Int) {
-        guard round < CapacitorTwilioVoicePlugin.audioWatchdogDelays.count else { return }
-        let delay = CapacitorTwilioVoicePlugin.audioWatchdogDelays[round]
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        guard round < CapacitorTwilioVoicePlugin.audioWatchdogRounds else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + CapacitorTwilioVoicePlugin.audioWatchdogInterval) { [weak self] in
             self?.runAudioWatchdogCheck(token: token, uuid: uuid, round: round)
         }
     }
 
+    // The call this check belongs to, only while it is still that same live call.
     private func liveWatchdogCall(token: Int, uuid: UUID) -> Call? {
-        guard token == audioWatchdogToken,
+        guard watchdogTokens[uuid] == token,
               let call = activeCalls[uuid.uuidString],
               call.state == .connected else { return nil }
         return call
@@ -1356,10 +1390,15 @@ extension CapacitorTwilioVoicePlugin {
         guard let call = liveWatchdogCall(token: token, uuid: uuid) else { return }
 
         if call.isOnHold {
-            // A hold the staffer chose is never touched. A hold iOS imposed is
-            // lifted only when no other call is really live on the phone.
-            if heldByCallKit {
-                releaseStuckCallKitHold(callUUID: uuid, round: round)
+            // A hold the staffer chose is never touched (heldByCallKit is false
+            // for the app's own button; the time window excludes a person
+            // tapping Hold on the iOS screen). Only a hold iOS imposed right at
+            // connect is the stuck-hold failure.
+            if heldByCallKit, let holdAt = callKitHoldAt[uuid] {
+                let connectedAt = callConnectedAt[uuid] ?? holdAt
+                if holdAt.timeIntervalSince(connectedAt) <= CapacitorTwilioVoicePlugin.stuckHoldWindow {
+                    releaseStuckCallKitHold(callUUID: uuid, round: round)
+                }
             }
             scheduleAudioWatchdogCheck(token: token, uuid: uuid, round: round + 1)
             return
@@ -1373,10 +1412,21 @@ extension CapacitorTwilioVoicePlugin {
                 let micLevel = local.map { Int($0.audioLevel) }.max() ?? -1
                 let speakerLevel = remote.map { Int($0.audioLevel) }.max() ?? -1
                 let packetsIn = remote.reduce(0) { $0 + Int($1.packetsReceived) }
-                // Dead = nothing in EITHER direction while the network is
-                // delivering packets. A muted staffer is never "dead".
-                let dead = micLevel == 0 && speakerLevel == 0 && packetsIn > 0 && !live.isMuted && !live.isOnHold
-                let canRestart = dead && self.audioWatchdogRestarts < CapacitorTwilioVoicePlugin.audioWatchdogMaxRestarts
+                let packetsSent = local.reduce(0) { $0 + Int($1.packetsSent) }
+                // Nothing in EITHER direction while the network delivers packets.
+                // A muted or held staffer is never "dead".
+                let deadNow = micLevel == 0 && speakerLevel == 0 && packetsIn > 0 && !live.isMuted && !live.isOnHold
+                // One quiet instant is not enough on its own. Restart when the
+                // plugin's own state says audio is off, or on a second dead
+                // reading in a row with nothing new sent from the mic.
+                let audioOff = !self.audioDevice.isEnabled || !self.audioSessionActive
+                let prevDead = self.watchdogLastDead[uuid] ?? false
+                let sentStalled = self.watchdogLastPacketsSent[uuid].map { $0 == packetsSent } ?? false
+                let confirmed = deadNow && (audioOff || (prevDead && sentStalled))
+                self.watchdogLastDead[uuid] = deadNow
+                self.watchdogLastPacketsSent[uuid] = packetsSent
+                let restarts = self.watchdogRestarts[uuid] ?? 0
+                let canRestart = confirmed && restarts < CapacitorTwilioVoicePlugin.audioWatchdogMaxRestarts
                 var data: [String: Any] = [
                     "callSid": uuid.uuidString,
                     "twilioSid": live.sid,
@@ -1384,21 +1434,23 @@ extension CapacitorTwilioVoicePlugin {
                     "micLevel": micLevel,
                     "speakerLevel": speakerLevel,
                     "packetsIn": packetsIn,
+                    "packetsSent": packetsSent,
                     "sessionActive": self.audioSessionActive,
                     "audioEnabled": self.audioDevice.isEnabled,
-                    "action": canRestart ? "restart" : (dead ? "gave-up" : "ok")
+                    "action": canRestart ? "restart" : (confirmed ? "gave-up" : (deadNow ? "watching" : "ok"))
                 ]
                 if canRestart {
-                    self.audioWatchdogRestarts += 1
-                    data["restart"] = self.audioWatchdogRestarts
-                    if let err = self.restartCallAudio() { data["error"] = err }
+                    self.watchdogRestarts[uuid] = restarts + 1
+                    self.watchdogLastDead[uuid] = false
+                    data["restart"] = restarts + 1
+                    if let err = self.restartCallAudio(token: token, uuid: uuid) { data["error"] = err }
                 }
-                // Healthy calls are logged once (round 0) so there is a baseline;
-                // every dead reading and every restart is logged.
-                if dead || round == 0 {
+                // A healthy call is logged once (round 0) as a baseline; every
+                // dead reading and every restart is logged.
+                if deadNow || round == 0 {
                     self.notifyListeners("audioWatchdog", data: data)
                 }
-                if dead || round == 0 {
+                if deadNow || round == 0 {
                     self.scheduleAudioWatchdogCheck(token: token, uuid: uuid, round: round + 1)
                 }
             }
@@ -1406,12 +1458,11 @@ extension CapacitorTwilioVoicePlugin {
     }
 
     // Turn the call's audio back on: make sure the session is active (CallKit
-    // normally does this in didActivate; on a dead call it never did), then
-    // stop and restart the audio graph and re-apply the chosen route.
-    private func restartCallAudio() -> String? {
+    // normally does this in didActivate; on a dead call it never did), then stop
+    // and restart the audio graph and re-apply the staffer's speaker choice.
+    private func restartCallAudio(token: Int, uuid: UUID) -> String? {
         var failure: String?
         let session = AVAudioSession.sharedInstance()
-        let wasSpeaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
         do {
             if session.category != .playAndRecord || session.mode != .voiceChat {
                 try session.setCategory(.playAndRecord,
@@ -1424,18 +1475,22 @@ extension CapacitorTwilioVoicePlugin {
             failure = error.localizedDescription
             NSLog("Audio watchdog: could not activate session: \(error.localizedDescription)")
         }
+        let speaker = lastSpeakerChoice
         audioDevice.isEnabled = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            guard let self = self, let call = self.getActiveCall(), !call.isOnHold else { return }
+            // Only the same call, still live and not on hold, gets its audio back.
+            guard let self = self,
+                  let call = self.liveWatchdogCall(token: token, uuid: uuid),
+                  !call.isOnHold else { return }
             self.audioDevice.isEnabled = true
-            self.toggleAudioRoute(toSpeaker: wasSpeaker)
+            self.toggleAudioRoute(toSpeaker: speaker)
         }
         return failure
     }
 
-    // iOS held our call (it does that when it believes another call is live).
-    // If the only other live call is a stale one of OURS, end it; if nothing
-    // else is live, lift the hold. A real cellular call is never touched.
+    // iOS held our call right at connect (it does that when it believes another
+    // call is live). If the only other live call is a stale one of OURS, end it;
+    // if nothing else is live, lift the hold. A real call is never touched.
     private func releaseStuckCallKitHold(callUUID: UUID, round: Int) {
         let others = callObserver.calls.filter { $0.uuid != callUUID && !$0.hasEnded }
         let ghosts = others.filter { other in
@@ -1458,6 +1513,8 @@ extension CapacitorTwilioVoicePlugin {
         if let sid = activeCalls[callUUID.uuidString]?.sid { data["twilioSid"] = sid }
         notifyListeners("audioWatchdog", data: data)
         guard realOthers == 0 else { return }
+        // Released once; a second release is never attempted for the same hold.
+        callKitHoldAt.removeValue(forKey: callUUID)
         let transaction = CXTransaction(action: CXSetHeldCallAction(call: callUUID, onHold: false))
         callKitCallController.request(transaction) { error in
             if let error = error {
@@ -1473,7 +1530,7 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
     public func providerDidReset(_ provider: CXProvider) {
         audioDevice.isEnabled = false
         audioSessionActive = false
-        notifyListeners("audioSessionChanged", data: ["state": "reset", "hasActiveCall": !activeCalls.isEmpty])
+        notifyListeners("audioSessionChanged", data: ["state": "reset", "hasActiveCall": !activeCalls.isEmpty, "twilioSid": currentTwilioSid() as Any])
         // CallKit has torn everything down; nothing is at anyone's ear.
         updateProximityMonitoring()
     }
@@ -1497,13 +1554,13 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
         audioSessionActive = true
         NSLog("Audio device enabled after CallKit activation")
         // Logged so a silent call shows whether iOS ever handed us the audio.
-        notifyListeners("audioSessionChanged", data: ["state": "activated", "hasActiveCall": !activeCalls.isEmpty])
+        notifyListeners("audioSessionChanged", data: ["state": "activated", "hasActiveCall": !activeCalls.isEmpty, "twilioSid": currentTwilioSid() as Any])
     }
 
     public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         audioDevice.isEnabled = false
         audioSessionActive = false
-        notifyListeners("audioSessionChanged", data: ["state": "deactivated", "hasActiveCall": !activeCalls.isEmpty])
+        notifyListeners("audioSessionChanged", data: ["state": "deactivated", "hasActiveCall": !activeCalls.isEmpty, "twilioSid": currentTwilioSid() as Any])
     }
 
     public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
@@ -1609,6 +1666,11 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
             // "Hold & Accept" on a cell call, must stay held when that call ends.
             let wasHeld = call.isOnHold
             heldByCallKit = action.isOnHold && !byApp && !wasHeld
+            if heldByCallKit {
+                callKitHoldAt[action.callUUID] = Date()
+            } else if !action.isOnHold {
+                callKitHoldAt.removeValue(forKey: action.callUUID)
+            }
             call.isOnHold = action.isOnHold
             if !call.isOnHold {
                 audioDevice.isEnabled = true
