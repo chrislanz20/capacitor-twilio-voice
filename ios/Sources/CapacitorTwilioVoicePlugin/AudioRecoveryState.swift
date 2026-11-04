@@ -1,25 +1,6 @@
 import Foundation
 
-// Pure state policy. No CallKit identity or AVAudioSession operation lives here.
-struct AudioRecoveryState {
-    let generation: Int
-    let tokenMatches: Bool
-    let connected: Bool
-    let held: Bool
-    let muted: Bool
-    let otherCallKitCalls: Int
-    let otherPluginCalls: Int
-
-    var permitsRecovery: Bool {
-        tokenMatches && connected && !held && !muted
-            && otherCallKitCalls == 0 && otherPluginCalls == 0
-    }
-
-    func permitsDelayedRecovery(after capturedGeneration: Int) -> Bool {
-        generation == capturedGeneration && permitsRecovery
-    }
-}
-
+// Structured error data only. No recovery policy lives here.
 struct AudioRecoveryFailure {
     let phase: String
     let error: NSError
