@@ -110,6 +110,16 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
     // still thinks is live (it holds the next call) can be told apart from a
     // real cellular call, which must never be touched.
     private var reportedCallKitUUIDs = Set<UUID>()
+    // E-017 (Nov 8 2026) diagnostics: when each call was answered, and when
+    // CallKit last switched the sound on / off. Timings only, never ids.
+    private var answerRequestedAt: [UUID: Date] = [:]
+    private var lastAudioActivateAt: Date?
+    private var lastAudioDeactivateAt: Date?
+    // The "move to computer" ring (eskew-phone-system lib/move-to-computer.ts)
+    // is for the staffer's computer. It reaches this phone too (one shared
+    // identity), so it is reported to CallKit as iOS requires and ended at once,
+    // and never declined: a decline can end the ring on every device.
+    private static let computerOnlyParam = "SaveYaComputerOnly"
 
     deinit {
         // Remove observers
@@ -1189,6 +1199,11 @@ extension CapacitorTwilioVoicePlugin: NotificationDelegate {
     public func callInviteReceived(callInvite: CallInvite) {
         UserDefaults.standard.set(Date(), forKey: kCachedBindingDate)
 
+        if callInvite.customParameters?[CapacitorTwilioVoicePlugin.computerOnlyParam] == "1" {
+            ignoreComputerOnlyInvite(callInvite)
+            return
+        }
+
         let from = (callInvite.from ?? "Unknown").replacingOccurrences(of: "client:", with: "")
         let niceName = callInvite.customParameters?["CapacitorTwilioCallerName"] ?? from
         reportIncomingCall(from: from, niceName: niceName, uuid: callInvite.uuid)
@@ -1201,6 +1216,27 @@ extension CapacitorTwilioVoicePlugin: NotificationDelegate {
             "to": callInvite.to,
             "customParams": callInvite.customParameters ?? [:]
         ])
+    }
+
+    // iOS ends an app that receives a VoIP push and reports no call, so the
+    // computer's ring is reported, then ended once CallKit has it. It is never
+    // stored as an invite and never rejected, and the web app never sees it.
+    private func ignoreComputerOnlyInvite(_ callInvite: CallInvite) {
+        guard let provider = callKitProvider else { return }
+        let uuid = callInvite.uuid
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: "Computer")
+        update.localizedCallerName = "Moving to your computer"
+        update.hasVideo = false
+        provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.callKitProvider?.reportCall(with: uuid, endedAt: Date(), reason: .answeredElsewhere)
+                var data: [String: Any] = ["kind": "computer-only-ignored"]
+                if let sid = self.currentTwilioSid() { data["twilioSid"] = sid }
+                self.notifyListeners("audioCallKitEvent", data: data)
+            }
+        }
     }
 
     public func cancelledCallInviteReceived(cancelledCallInvite: CancelledCallInvite, error: Error) {
@@ -1372,6 +1408,7 @@ extension CapacitorTwilioVoicePlugin {
         watchdogLastPacketsSent.removeValue(forKey: uuid)
         callConnectedAt.removeValue(forKey: uuid)
         callKitHoldAt.removeValue(forKey: uuid)
+        answerRequestedAt.removeValue(forKey: uuid)
     }
 
     private func scheduleAudioWatchdogCheck(token: Int, uuid: UUID, round: Int) {
@@ -1452,8 +1489,10 @@ extension CapacitorTwilioVoicePlugin {
                     data.merge(self.restartCallAudio(token: token, uuid: uuid)) { _, new in new }
                 }
                 // A healthy call is logged once (round 0) as a baseline; every
-                // dead reading and every restart is logged.
+                // dead reading and every restart is logged, with iOS's call list,
+                // the audio session and the CallKit timings at that moment.
                 if deadNow || round == 0 {
+                    data.merge(self.audioFacts(for: uuid)) { old, _ in old }
                     self.notifyListeners("audioWatchdog", data: data)
                 }
                 if deadNow || round == 0 {
@@ -1475,6 +1514,106 @@ extension CapacitorTwilioVoicePlugin {
         return ["otherOwnCalls": own, "otherExternalCalls": others.count - own,
                 "otherLiveCalls": others.count,
                 "otherPluginCalls": pluginUUIDs.filter { $0 != uuid }.count]
+    }
+
+    // MARK: E-017 diagnostics (structural only: Apple constant names, booleans,
+    // counts and milliseconds; never a number, a name or a call id).
+
+    private func pluginKnownUUIDs() -> Set<UUID> {
+        Set(activeCalls.values.filter { $0.state != .disconnected }.compactMap { $0.uuid })
+            .union(activeCallInvites.values.map { $0.uuid })
+            .union(pendingOutgoingCalls.keys)
+    }
+
+    private func currentCallUUID() -> UUID? {
+        if let uuid = activeCall?.uuid { return uuid }
+        if activeCalls.count == 1 { return activeCalls.first?.value.uuid }
+        return nil
+    }
+
+    // iOS's own call list: ours vs other apps', connected, held, ended.
+    private func callListSnapshot(current: UUID?) -> [[String: Any]] {
+        let known = pluginKnownUUIDs()
+        return callObserver.calls.prefix(8).map { c -> [String: Any] in
+            ["mine": reportedCallKitUUIDs.contains(c.uuid),
+             "current": c.uuid == current,
+             "known": known.contains(c.uuid),
+             "connected": c.hasConnected,
+             "onHold": c.isOnHold,
+             "outgoing": c.isOutgoing,
+             "ended": c.hasEnded]
+        }
+    }
+
+    // The audio session right now. Port TYPES only: port names can carry a
+    // person's name ("Evelise's AirPods").
+    private func audioSessionSnapshot() -> [String: Any] {
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute
+        return ["category": session.category.rawValue,
+                "mode": session.mode.rawValue,
+                "outputs": route.outputs.prefix(4).map { $0.portType.rawValue },
+                "inputs": route.inputs.prefix(4).map { $0.portType.rawValue },
+                "otherAudioPlaying": session.isOtherAudioPlaying,
+                "secondarySilenced": session.secondaryAudioShouldBeSilencedHint]
+    }
+
+    // Milliseconds since this call's answer / connect / iOS-imposed hold, and
+    // since CallKit last switched the sound on or off.
+    private func callTimings(for uuid: UUID?) -> [String: Any] {
+        let now = Date()
+        var t: [String: Any] = [:]
+        func put(_ key: String, _ when: Date?) {
+            guard let when = when else { return }
+            let ms = (now.timeIntervalSince(when) * 1000).rounded()
+            t[key] = Int(max(-600_000, min(86_400_000, ms)))
+        }
+        if let uuid = uuid {
+            put("msSinceAnswer", answerRequestedAt[uuid])
+            put("msSinceConnect", callConnectedAt[uuid])
+            put("msSinceHold", callKitHoldAt[uuid])
+        }
+        put("msSinceActivate", lastAudioActivateAt)
+        put("msSinceDeactivate", lastAudioDeactivateAt)
+        return t
+    }
+
+    private func audioFacts(for uuid: UUID?) -> [String: Any] {
+        var facts = callTimings(for: uuid)
+        facts["calls"] = callListSnapshot(current: uuid)
+        facts["session"] = audioSessionSnapshot()
+        return facts
+    }
+
+    private func emitCallKitEvent(_ kind: String, uuid: UUID?, extra: [String: Any] = [:]) {
+        var data = audioFacts(for: uuid)
+        data["kind"] = kind
+        data["lifecycleGeneration"] = audioLifecycleGeneration
+        if let uuid = uuid, let sid = activeCalls[uuid.uuidString]?.sid ?? activeCallInvites[uuid.uuidString]?.callSid {
+            data["twilioSid"] = sid
+        } else if let sid = currentTwilioSid() {
+            data["twilioSid"] = sid
+        }
+        data.merge(extra) { _, new in new }
+        notifyListeners("audioCallKitEvent", data: data)
+    }
+
+    // E-017 recovery: before answering, end any call of OURS that iOS still
+    // lists as live but this plugin no longer tracks (a call that ended in
+    // Twilio and never in CallKit). iOS gives the sound to such a call instead
+    // of the new one. Another app's call (cell, FaceTime, WhatsApp) is never
+    // touched, and nothing this plugin is tracking is touched either.
+    private func endStaleOwnCalls(except keep: UUID) -> Int {
+        let known = pluginKnownUUIDs()
+        let stale = callObserver.calls.filter { c in
+            c.uuid != keep && !c.hasEnded
+                && reportedCallKitUUIDs.contains(c.uuid)
+                && !known.contains(c.uuid)
+        }
+        for c in stale {
+            callKitProvider?.reportCall(with: c.uuid, endedAt: Date(), reason: .failed)
+        }
+        return stale.count
     }
 
     private func restartCallAudio(token: Int, uuid: UUID) -> [String: Any] {
@@ -1530,6 +1669,7 @@ extension CapacitorTwilioVoicePlugin {
             "otherLiveCalls": realOthers
         ]
         if let sid = activeCalls[callUUID.uuidString]?.sid { data["twilioSid"] = sid }
+        data.merge(audioFacts(for: callUUID)) { old, _ in old }
         notifyListeners("audioWatchdog", data: data)
         guard realOthers == 0 else { return }
         // Released once; a second release is never attempted for the same hold.
@@ -1550,7 +1690,9 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
         audioLifecycleGeneration &+= 1
         audioDevice.isEnabled = false
         audioSessionActive = false
-        notifyListeners("audioSessionChanged", data: ["state": "reset", "hasActiveCall": !activeCalls.isEmpty, "lifecycleGeneration": audioLifecycleGeneration, "phase": "callback", "twilioSid": currentTwilioSid() as Any])
+        lastAudioDeactivateAt = Date()
+        emitCallKitEvent("reset", uuid: currentCallUUID())
+        notifyListeners("audioSessionChanged", data: (["state": "reset", "hasActiveCall": !activeCalls.isEmpty, "lifecycleGeneration": audioLifecycleGeneration, "phase": "callback", "twilioSid": currentTwilioSid() as Any] as [String: Any]).merging(callTimings(for: currentCallUUID())) { old, _ in old })
         // CallKit has torn everything down; nothing is at anyone's ear.
         updateProximityMonitoring()
     }
@@ -1573,16 +1715,20 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
 
         audioDevice.isEnabled = true
         audioSessionActive = true
+        lastAudioActivateAt = Date()
+        emitCallKitEvent("activated", uuid: currentCallUUID())
         NSLog("Audio device enabled after CallKit activation")
         // Logged so a silent call shows whether iOS ever handed us the audio.
-        notifyListeners("audioSessionChanged", data: ["state": "activated", "hasActiveCall": !activeCalls.isEmpty, "lifecycleGeneration": audioLifecycleGeneration, "phase": "callback", "twilioSid": currentTwilioSid() as Any])
+        notifyListeners("audioSessionChanged", data: (["state": "activated", "hasActiveCall": !activeCalls.isEmpty, "lifecycleGeneration": audioLifecycleGeneration, "phase": "callback", "twilioSid": currentTwilioSid() as Any] as [String: Any]).merging(callTimings(for: currentCallUUID())) { old, _ in old })
     }
 
     public func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         audioLifecycleGeneration &+= 1
         audioDevice.isEnabled = false
         audioSessionActive = false
-        notifyListeners("audioSessionChanged", data: ["state": "deactivated", "hasActiveCall": !activeCalls.isEmpty, "lifecycleGeneration": audioLifecycleGeneration, "phase": "callback", "twilioSid": currentTwilioSid() as Any])
+        lastAudioDeactivateAt = Date()
+        emitCallKitEvent("deactivated", uuid: currentCallUUID())
+        notifyListeners("audioSessionChanged", data: (["state": "deactivated", "hasActiveCall": !activeCalls.isEmpty, "lifecycleGeneration": audioLifecycleGeneration, "phase": "callback", "twilioSid": currentTwilioSid() as Any] as [String: Any]).merging(callTimings(for: currentCallUUID())) { old, _ in old })
     }
 
     public func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
@@ -1655,6 +1801,12 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
     }
 
     public func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        // E-017: the state iOS is in at the moment of answer, then clear any
+        // stale call of ours so iOS gives the sound to THIS call.
+        let callsBefore = callListSnapshot(current: action.callUUID)
+        let staleEnded = endStaleOwnCalls(except: action.callUUID)
+        answerRequestedAt[action.callUUID] = Date()
+        emitCallKitEvent("answer", uuid: action.callUUID, extra: ["calls": callsBefore, "staleCallsEnded": staleEnded])
         performAnswerVoiceCall(uuid: action.callUUID) { _ in
             // Call completion is handled in the delegate methods
         }
@@ -1699,6 +1851,8 @@ extension CapacitorTwilioVoicePlugin: CXProviderDelegate {
                 activeCall = call
             }
             action.fulfill()
+            emitCallKitEvent(action.isOnHold ? "hold" : "unhold", uuid: action.callUUID,
+                             extra: ["onHold": action.isOnHold, "byApp": byApp])
             // The one place hold changes, whoever asked (app button, iOS for a
             // second call, the system call screen): the app's button follows it.
             notifyListeners("callHoldChanged", data: ["callSid": action.callUUID.uuidString, "onHold": action.isOnHold, "byApp": byApp])
