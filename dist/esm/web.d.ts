@@ -78,4 +78,11 @@ export declare class CapacitorTwilioVoiceWeb extends WebPlugin implements Capaci
     getPluginVersion(): Promise<{
         version: string;
     }>;
+    /**
+     * What this native build can do (Eskew fork, E-017). Builds without this
+     * method reject the call; treat every capability as missing then.
+     */
+    getCapabilities(): Promise<{
+        moveToComputer: boolean;
+    }>;
 }

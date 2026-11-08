@@ -57,6 +57,9 @@ class CapacitorTwilioVoiceWeb extends core.WebPlugin {
     async getPluginVersion() {
         return { version: 'web' };
     }
+    async getCapabilities() {
+        return { moveToComputer: false };
+    }
 }
 
 var web = /*#__PURE__*/Object.freeze({

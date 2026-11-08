@@ -88,4 +88,8 @@ export class CapacitorTwilioVoiceWeb extends WebPlugin implements CapacitorTwili
   async getPluginVersion(): Promise<{ version: string }> {
     return { version: 'web' };
   }
+
+  async getCapabilities(): Promise<{ moveToComputer: boolean }> {
+    return { moveToComputer: false };
+  }
 }

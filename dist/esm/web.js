@@ -59,5 +59,8 @@ export class CapacitorTwilioVoiceWeb extends WebPlugin {
     async getPluginVersion() {
         return { version: 'web' };
     }
+    async getCapabilities() {
+        return { moveToComputer: false };
+    }
 }
 //# sourceMappingURL=web.js.map

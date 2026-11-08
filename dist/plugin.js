@@ -56,6 +56,9 @@ var capacitorCapacitorTwilioVoice = (function (exports, core) {
         async getPluginVersion() {
             return { version: 'web' };
         }
+        async getCapabilities() {
+            return { moveToComputer: false };
+        }
     }
 
     var web = /*#__PURE__*/Object.freeze({

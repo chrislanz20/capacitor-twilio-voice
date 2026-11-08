@@ -845,6 +845,18 @@ export interface CapacitorTwilioVoicePlugin {
    * @throws An error if something went wrong
    */
   getPluginVersion(): Promise<{ version: string }>;
+
+  /**
+   * What this native build can do (Eskew fork, E-017).
+   *
+   * `moveToComputer`: this build keeps quiet on a "move to computer" ring
+   * (an invite with `SaveYaComputerOnly=1`) and never declines it, so the
+   * staffer's computer keeps ringing. Builds without this method reject the
+   * call; treat every capability as missing then.
+   *
+   * @returns {Promise<{ moveToComputer: boolean }>}
+   */
+  getCapabilities(): Promise<{ moveToComputer: boolean }>;
 }
 
 /**

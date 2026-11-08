@@ -49,7 +49,8 @@ public class CapacitorTwilioVoicePlugin: CAPPlugin, CAPBridgedPlugin, PushKitEve
         CAPPluginMethod(name: "getCallStatus", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "checkMicrophonePermission", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestMicrophonePermission", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getPluginVersion", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getPluginVersion", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getCapabilities", returnType: CAPPluginReturnPromise)
     ]
 
     // MARK: - Properties
@@ -1939,6 +1940,16 @@ extension CapacitorTwilioVoicePlugin: AVAudioPlayerDelegate {
 
     @objc func getPluginVersion(_ call: CAPPluginCall) {
         call.resolve(["version": self.pluginVersion])
+    }
+
+    /// E-017: what this native build can do, so the app only offers a feature
+    /// the installed build really has. Older builds have no such method, the
+    /// call rejects, and the app treats every capability as missing.
+    /// `moveToComputer`: an invite carrying SaveYaComputerOnly=1 is reported to
+    /// CallKit and ended at once, never stored and never rejected, so the
+    /// staffer's computer keeps ringing.
+    @objc func getCapabilities(_ call: CAPPluginCall) {
+        call.resolve(["moveToComputer": true])
     }
 
 }
